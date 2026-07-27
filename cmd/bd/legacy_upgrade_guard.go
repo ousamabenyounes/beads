@@ -114,6 +114,9 @@ func isHistoricalSQLiteWorkspace(beadsDir string, cfg *configfile.Config) bool {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
+		if name == "embeddeddolt" && entry.IsDir() {
+			continue
+		}
 		if name == databaseName || name == "issues.jsonl" || name == databaseName+"-wal" || name == databaseName+"-shm" {
 			if !isRegularFile(filepath.Join(beadsDir, name)) {
 				return false
@@ -157,8 +160,27 @@ func guardUndiscoveredLegacyWorkspace() error {
 }
 
 func hasCurrentEmbeddedDoltRoot(beadsDir string) bool {
-	info, err := os.Lstat(filepath.Join(beadsDir, "embeddeddolt"))
-	return err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0
+	root := filepath.Join(beadsDir, "embeddeddolt")
+	info, err := os.Lstat(root)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	databases, err := os.ReadDir(root)
+	if err != nil {
+		return false
+	}
+	// A failed or interrupted open may leave the root behind. Require the
+	// coarse repository marker one level below it; never inspect Dolt files.
+	for _, database := range databases {
+		if !database.IsDir() || database.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		marker, err := os.Lstat(filepath.Join(root, database.Name(), ".dolt"))
+		if err == nil && marker.IsDir() && marker.Mode()&os.ModeSymlink == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func hasLegacyDoltRoot(beadsDir string) bool {

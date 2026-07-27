@@ -115,7 +115,7 @@ func TestLegacyUpgradeGuardMetadataLessSQLiteAndCurrentEmbeddedPrecedence(t *tes
 		if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte("stale SQLite artifact"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Mkdir(filepath.Join(beadsDir, "embeddeddolt"), 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt", "beads", ".dolt"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Mkdir(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
@@ -123,6 +123,38 @@ func TestLegacyUpgradeGuardMetadataLessSQLiteAndCurrentEmbeddedPrecedence(t *tes
 		}
 		if err := guardLegacyUpgradeWorkspace(beadsDir); err != nil {
 			t.Fatalf("current embedded workspace was refused due to stale artifacts: %v", err)
+		}
+	})
+
+	t.Run("empty embedded root does not hide metadata-less sqlite", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(beadsDir, "vc.db"), []byte("SQLite format 3\x00"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(beadsDir, "embeddeddolt"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := guardLegacyUpgradeWorkspace(beadsDir); !isLegacyUpgradeRefusal(err) {
+			t.Fatalf("guardLegacyUpgradeWorkspace() = %v, want migration refusal", err)
+		}
+	})
+
+	t.Run("empty embedded root does not hide legacy dolt", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, localVersionFile), []byte("0.55.4\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(beadsDir, "embeddeddolt"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := guardLegacyUpgradeWorkspace(beadsDir); !isLegacyUpgradeRefusal(err) {
+			t.Fatalf("guardLegacyUpgradeWorkspace() = %v, want migration refusal", err)
 		}
 	})
 
