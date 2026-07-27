@@ -15,6 +15,8 @@ workspace=""
 public_bridge_destination=""
 server_pid=""
 server_port=""
+sqlite_writer_pid=""
+sqlite_writer_stop=""
 keep_workspace=false
 DOLT_BIN="${DOLT_BIN:-dolt}"
 
@@ -84,6 +86,7 @@ require_command jq
 require_command git
 require_command timeout
 require_command sha256sum
+require_command python3
 [ "$(uname -s)" = Linux ] || die 'the pinned authentic-binary corpus supports Linux only'
 [ "$(uname -m)" = x86_64 ] || die 'the pinned authentic-binary corpus supports linux/amd64 only'
 [[ "$OP_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die 'HISTORICAL_DOLT_E2E_TIMEOUT must be a positive number of seconds'
@@ -99,11 +102,20 @@ candidate=$(realpath -e -- "$candidate") || die 'candidate binary cannot be reso
 [ -x "$candidate" ] || die "candidate binary is not executable: $candidate"
 
 cleanup() {
+    stop_sqlite_writer
     stop_historical_server
     if ! $keep_workspace; then
         [ -z "$workspace" ] || rm -rf -- "$workspace"
         [ -z "$public_bridge_destination" ] || rm -rf -- "$public_bridge_destination"
     fi
+}
+
+stop_sqlite_writer() {
+    [ -n "$sqlite_writer_pid" ] || return 0
+    : > "$sqlite_writer_stop"
+    wait "$sqlite_writer_pid" 2>/dev/null || true
+    sqlite_writer_pid=""
+    sqlite_writer_stop=""
 }
 trap cleanup EXIT
 
@@ -249,7 +261,7 @@ record_retained_legacy() {
 record_retained_classic() {
     local version="$1"
     find "$workspace/.beads" -maxdepth 1 -type f -name '*.pre-migration' -print0
-    printf '%s\0' "$workspace/.beads/classic-$version-export.jsonl"
+    printf '%s\0' "$workspace/classic-$version-current-reader.jsonl"
 }
 
 record_retained_v017() {
@@ -293,6 +305,63 @@ verify_legacy_issues_jsonl_sentinel() {
 
 classic_source_fingerprint() {
     beads_dir_fingerprint "$workspace/.beads"
+}
+
+export_classic_sqlite_with_candidate() {
+    local version="$1" output="$2" task ready before after
+    task=$(sed -n '1p' "$workspace/fixture-ids")
+    ready="$workspace/sqlite-wal-ready"
+    sqlite_writer_stop="$workspace/sqlite-wal-stop"
+    python3 - "$workspace/.beads/beads.db" "$task" "$ready" "$sqlite_writer_stop" <<'PY' &
+import pathlib
+import sqlite3
+import sys
+import time
+
+database, issue_id, ready, stop = sys.argv[1:]
+connection = sqlite3.connect(database)
+if connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
+    raise SystemExit("could not enable WAL")
+connection.execute("PRAGMA wal_autocheckpoint=0")
+connection.execute(
+    "UPDATE issues SET notes = ?, due_at = ? WHERE id = ?",
+    ("Committed WAL data survived the current reader.", "2026-01-04T05:06:07.123456789Z", issue_id),
+)
+connection.execute(
+    "UPDATE comments SET created_at = ? WHERE issue_id = ?",
+    ("2026-01-07T11:12:13.876543210Z", issue_id),
+)
+connection.commit()
+pathlib.Path(ready).touch()
+while not pathlib.Path(stop).exists():
+    time.sleep(0.05)
+connection.close()
+PY
+    sqlite_writer_pid=$!
+    for _ in {1..100}; do
+        [ -e "$ready" ] && break
+        kill -0 "$sqlite_writer_pid" 2>/dev/null ||
+            die "$version: SQLite WAL writer exited before becoming ready"
+        sleep 0.05
+    done
+    [ -e "$ready" ] && [ -s "$workspace/.beads/beads.db-wal" ] ||
+        die "$version: committed WAL fixture was not created"
+
+    before=$(classic_source_fingerprint) ||
+        die "$version: could not fingerprint committed WAL source"
+    run_in_workspace "$candidate" migrate legacy-sqlite \
+        --source-db "$workspace/.beads/beads.db" --output "$output" ||
+        die "$version: current legacy SQLite reader failed"
+    after=$(classic_source_fingerprint) ||
+        die "$version: could not resnapshot committed WAL source"
+    [ "$after" = "$before" ] ||
+        die "$version: current legacy SQLite reader changed its source"
+    jq -s -e --arg task "$task" '
+        length == 3 and
+        any(.[]; .id == $task and .notes == "Committed WAL data survived the current reader.")
+    ' "$output" >/dev/null ||
+        die "$version: current reader omitted committed WAL data"
+    stop_sqlite_writer
 }
 
 beads_dir_fingerprint() {
@@ -583,7 +652,12 @@ preserve_classic_rollback() {
 }
 
 run_classic_sqlite_upgrade() {
-    local version="$1" source before after output export_file="$workspace/.beads/classic-$1-export.jsonl" file
+    local version="$1" source before after output export_file="$workspace/classic-$1-current-reader.jsonl" file task reexport reader_times current_times
+    local timestamp_projection='map({
+        id, created_at, updated_at, closed_at, compacted_at, due_at, defer_until,
+        dependency_created_at: ((.dependencies // []) | map(.created_at) | sort),
+        comment_created_at: ((.comments // []) | map(.created_at) | sort)
+    }) | sort_by(.id)'
     printf '\n● Historical SQLite upgrade: %s → candidate\n' "$version"
     source=$(download_verified_release_binary "$version") || die "$version: verified release is unavailable"
     if [ "$version" = "$CONFIGURED_SQLITE_VERSION" ]; then
@@ -598,6 +672,7 @@ run_classic_sqlite_upgrade() {
         run_in_workspace "$source" init --quiet --prefix histclassic || die "$version: source init failed"
     fi
     create_historical_fixture "$version" "$source"
+    export_classic_sqlite_with_candidate "$version" "$export_file"
     before=$(classic_source_fingerprint) || die "$version: could not snapshot historical SQLite source"
     output="$workspace/candidate-classic-refusal.out"
     if run_in_workspace "$candidate" list > "$output" 2>&1; then
@@ -623,12 +698,26 @@ run_classic_sqlite_upgrade() {
     fi
     verify_public_sqlite_bridge "$version" "$source" histclassic
     preserve_classic_rollback "$version"
-    export_source_jsonl "$version" "$source" "$export_file"
     save_retained_digest classic "$version"
     for file in "${CLASSIC_SQLITE_ROLLBACK_FILES[@]}"; do rm -f -- "$workspace/.beads/$file"; done
     cp -f "$export_file" "$workspace/.beads/issues.jsonl"
     run_in_workspace "$candidate" init --from-jsonl --quiet --skip-hooks --skip-agents --prefix histclassic ||
         die "$version: candidate could not import classic export"
+    reexport="$workspace/classic-$version-current-reexport.jsonl"
+    reader_times="$workspace/classic-$version-reader-timestamps.json"
+    current_times="$workspace/classic-$version-current-timestamps.json"
+    run_in_workspace "$candidate" export --all -o "$reexport" >/dev/null ||
+        die "$version: candidate could not re-export the fresh classic import"
+    jq -sS "$timestamp_projection" "$export_file" > "$reader_times" ||
+        die "$version: could not project reader timestamps"
+    jq -sS "$timestamp_projection" "$reexport" > "$current_times" ||
+        die "$version: could not project current timestamps"
+    cmp -s "$reader_times" "$current_times" ||
+        die "$version: fresh current import changed canonical reader timestamps"
+    task=$(sed -n '1p' "$workspace/fixture-ids")
+    run_in_workspace "$candidate" show "$task" --json | jq -e '
+        (if type == "array" then .[0] else . end).notes == "Committed WAL data survived the current reader."
+    ' >/dev/null || die "$version: WAL-resident notes did not survive candidate import"
     migrate_schema_current "$version" first
     verify_surviving_fixture "$version" classic
     verify_idempotent_migration "$version" classic
