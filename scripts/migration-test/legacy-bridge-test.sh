@@ -40,6 +40,56 @@ printf '%s\n' \
   'esac' >"$new"
 chmod +x "$old" "$new"
 
+# The release-binary version probe must not run an untrusted historical binary
+# in the caller's workspace or with its HOME/Git/runtime environment.
+probe_records="$tmp/release-probe-records"
+probe_caller="$tmp/release-probe-caller"
+probe_home="$tmp/release-probe-caller-home"
+probe_tmp="$tmp/release-probe-tmp"
+probe_binary="$tmp/release-probe-bd"
+probe_hanging_binary="$tmp/release-probe-hanging-bd"
+mkdir -p "$probe_records" "$probe_caller/.beads" "$probe_caller/bin" "$probe_home" "$probe_tmp"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\\n" "$PWD" > "'"$probe_records"'/cwd"' \
+  'printf "%s\\n" "$HOME" > "'"$probe_records"'/home"' \
+  'printf "%s\\n" "${XDG_CONFIG_HOME:-}" > "'"$probe_records"'/xdg-config"' \
+  'printf "%s\\n" "${GIT_CONFIG_GLOBAL:-}" > "'"$probe_records"'/git-global"' \
+  'printf "%s\\n" "$PATH" > "'"$probe_records"'/path"' \
+  'printf "%s\\n" "${BEADS_DIR:-}" > "'"$probe_records"'/beads-dir"' \
+  'printf "%s\\n" "${RELEASE_PROBE_SECRET:-}" > "'"$probe_records"'/secret"' \
+  'printf "%s\\n" "bd version 0.49.6"' >"$probe_binary"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'while :; do sleep 1; done' >"$probe_hanging_binary"
+chmod +x "$probe_binary" "$probe_hanging_binary"
+(
+  export HOME="$probe_home" XDG_CONFIG_HOME="$probe_home/config" XDG_CACHE_HOME="$probe_home/cache" TMPDIR="$probe_tmp"
+  source "$SCRIPT_DIR/lib/binary.sh"
+  (
+    cd "$probe_caller"
+    PATH="$probe_caller/bin:$PATH" BEADS_DIR="$probe_caller/.beads" RELEASE_PROBE_SECRET=caller-secret \
+      verify_release_binary_version v0.49.6 "$probe_binary"
+  )
+  test "$(<"$probe_records/cwd")" != "$probe_caller"
+  test "$(<"$probe_records/home")" != "$probe_home"
+  test "$(<"$probe_records/xdg-config")" != "$probe_home/config"
+  test "$(<"$probe_records/git-global")" = /dev/null
+  test "$(<"$probe_records/path")" = /usr/bin:/bin
+  test -z "$(<"$probe_records/beads-dir")"
+  test -z "$(<"$probe_records/secret")"
+  started=$(date +%s)
+  if RELEASE_BINARY_VERSION_TIMEOUT=1 verify_release_binary_version v0.49.6 "$probe_hanging_binary" >/dev/null 2>&1; then
+    printf 'release binary version probe accepted a hanging binary\n' >&2
+    exit 1
+  fi
+  test "$(( $(date +%s) - started ))" -lt 8
+  if compgen -G "$probe_tmp/bd-release-version-probe.*" >/dev/null; then
+    printf 'release binary version probe left its isolated workspace behind\n' >&2
+    exit 1
+  fi
+)
+
 fingerprint() {
   (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -r -0 sha256sum) | sha256sum | awk '{print $1}'
 }
