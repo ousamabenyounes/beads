@@ -384,9 +384,19 @@ func verifyFKs(ctx context.Context, db *sql.Tx, table string) error {
 	return nil
 }
 
+// loadIssuesProjection is the SELECT list feeding issueops.ScanIssueFrom in
+// loadIssues. It must emit exactly the canonical issueops.IssueSelectColumns
+// prefix — columns the legacy schema lacks are projected as NULL/0 — followed
+// by the legacy trailing columns scanned via (*legacyExtras).scanDests. That
+// canonical prefix is positional (ScanIssueFrom scans it slot-for-slot), so a
+// new column in issueops.IssueSelectColumns needs a matching placeholder here;
+// the variadic ScanIssueFrom boundary hides any count mismatch from the
+// compiler, so TestLoadIssuesProjectionArity guards the invariant and makes the
+// drift fail at test time instead of mid-migration.
+const loadIssuesProjection = `id,content_hash,title,description,design,acceptance_criteria,notes,status,priority,issue_type,assignee,estimated_minutes,CAST(created_at AS TEXT),created_by,owner,CAST(updated_at AS TEXT),NULL,NULL,external_ref,spec_id,compaction_level,NULL,compacted_at_commit,original_size,source_repo,close_reason,sender,ephemeral,0,wisp_type,pinned,is_template,await_type,await_id,timeout_ns,NULL,mol_type,event_kind,actor,target,payload,NULL,NULL,work_type,source_system,NULL,0,NULL,NULL,NULL,NULL,closed_by_session,CAST(deleted_at AS TEXT),deleted_by,delete_reason,original_type,crystallizes,quality_score,hook_bead,role_bead,agent_state,CAST(last_activity AS TEXT),role_type,rig,metadata,waiters,ephemeral,pinned,is_template,estimated_minutes,compaction_level,original_size,CAST(closed_at AS TEXT),CAST(compacted_at AS TEXT),CAST(due_at AS TEXT),CAST(defer_until AS TEXT)`
+
 func loadIssues(ctx context.Context, db *sql.Tx) ([]*types.Issue, error) {
-	const q = `SELECT id,content_hash,title,description,design,acceptance_criteria,notes,status,priority,issue_type,assignee,estimated_minutes,CAST(created_at AS TEXT),created_by,owner,CAST(updated_at AS TEXT),NULL,NULL,external_ref,spec_id,compaction_level,NULL,compacted_at_commit,original_size,source_repo,close_reason,sender,ephemeral,0,wisp_type,pinned,is_template,await_type,await_id,timeout_ns,NULL,mol_type,event_kind,actor,target,payload,NULL,NULL,work_type,source_system,NULL,0,NULL,NULL,NULL,closed_by_session,CAST(deleted_at AS TEXT),deleted_by,delete_reason,original_type,crystallizes,quality_score,hook_bead,role_bead,agent_state,CAST(last_activity AS TEXT),role_type,rig,metadata,waiters,ephemeral,pinned,is_template,estimated_minutes,compaction_level,original_size,CAST(closed_at AS TEXT),CAST(compacted_at AS TEXT),CAST(due_at AS TEXT),CAST(defer_until AS TEXT) FROM issues ORDER BY id`
-	rows, err := db.QueryContext(ctx, q)
+	rows, err := db.QueryContext(ctx, "SELECT "+loadIssuesProjection+" FROM issues ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -394,7 +404,7 @@ func loadIssues(ctx context.Context, db *sql.Tx) ([]*types.Issue, error) {
 	var result []*types.Issue
 	for rows.Next() {
 		var x legacyExtras
-		issue, err := issueops.ScanIssueFrom(rows, &x.closedBy, &x.deletedAt, &x.deletedBy, &x.deleteReason, &x.originalType, &x.crystallizes, &x.quality, &x.hookBead, &x.roleBead, &x.agentState, &x.lastActivity, &x.roleType, &x.rig, &x.metadata, &x.waiters, &x.ephemeral, &x.pinned, &x.template, &x.estimatedMinutes, &x.compactionLevel, &x.originalSize, &x.closedAt, &x.compactedAt, &x.dueAt, &x.deferUntil)
+		issue, err := issueops.ScanIssueFrom(rows, x.scanDests()...)
 		if err != nil {
 			return nil, err
 		}
@@ -404,6 +414,20 @@ func loadIssues(ctx context.Context, db *sql.Tx) ([]*types.Issue, error) {
 		result = append(result, issue)
 	}
 	return result, rows.Err()
+}
+
+// scanDests returns the destinations for the legacy trailing columns that
+// follow the canonical issueops.IssueSelectColumns prefix in
+// loadIssuesProjection, in projection order. ScanIssueFrom appends these after
+// the canonical scan destinations.
+func (x *legacyExtras) scanDests() []any {
+	return []any{
+		&x.closedBy, &x.deletedAt, &x.deletedBy, &x.deleteReason, &x.originalType,
+		&x.crystallizes, &x.quality, &x.hookBead, &x.roleBead, &x.agentState,
+		&x.lastActivity, &x.roleType, &x.rig, &x.metadata, &x.waiters,
+		&x.ephemeral, &x.pinned, &x.template, &x.estimatedMinutes, &x.compactionLevel,
+		&x.originalSize, &x.closedAt, &x.compactedAt, &x.dueAt, &x.deferUntil,
+	}
 }
 
 type legacyExtras struct {
@@ -423,6 +447,46 @@ func (x legacyExtras) validate(issue *types.Issue) error {
 	); err != nil {
 		return err
 	}
+	if err := x.applyOptionalTimestamps(issue); err != nil {
+		return err
+	}
+	if err := x.applyMetadataAndWaiters(issue); err != nil {
+		return err
+	}
+	if err := validateIssueStrings(issue); err != nil {
+		return err
+	}
+	if err := validateCurrentTextBytes(issue); err != nil {
+		return err
+	}
+	if err := validateIssueVarchars(issue); err != nil {
+		return err
+	}
+	if err := checkCurrentInts(
+		currentInt{"issue estimated_minutes", x.estimatedMinutes},
+		currentInt{"issue compaction_level", x.compactionLevel},
+		currentInt{"issue original_size", x.originalSize},
+	); err != nil {
+		return err
+	}
+	if err := x.applyCanonicalTimestamps(issue); err != nil {
+		return err
+	}
+	if err := checkRequiredScalars(issue); err != nil {
+		return err
+	}
+	if err := x.checkRemovedFields(issue); err != nil {
+		return err
+	}
+	if err := issue.Validate(); err != nil {
+		return fmt.Errorf("legacy SQLite issue %s: %w", issue.ID, err)
+	}
+	return nil
+}
+
+// applyOptionalTimestamps parses the legacy issue's optional timestamp columns
+// (closed_at, compacted_at, due_at, defer_until) and assigns them to issue.
+func (x legacyExtras) applyOptionalTimestamps(issue *types.Issue) error {
 	var err error
 	if issue.ClosedAt, err = parseOptionalTime("closed_at", x.closedAt); err != nil {
 		return fmt.Errorf("legacy SQLite issue %s: %w", issue.ID, err)
@@ -436,6 +500,13 @@ func (x legacyExtras) validate(issue *types.Issue) error {
 	if issue.DeferUntil, err = parseOptionalTime("defer_until", x.deferUntil); err != nil {
 		return fmt.Errorf("legacy SQLite issue %s: %w", issue.ID, err)
 	}
+	return nil
+}
+
+// applyMetadataAndWaiters validates the legacy metadata and waiters JSON blobs
+// (well-formed and free of unpaired surrogates) and assigns them to issue.
+// metadata is stored verbatim unless it is the empty object; waiters is decoded.
+func (x legacyExtras) applyMetadataAndWaiters(issue *types.Issue) error {
 	if x.metadata.Valid && x.metadata.String != "" && !json.Valid([]byte(x.metadata.String)) {
 		return fmt.Errorf("legacy SQLite issue %s has invalid metadata JSON", issue.ID)
 	}
@@ -460,28 +531,25 @@ func (x legacyExtras) validate(issue *types.Issue) error {
 		}
 		issue.Waiters = waiters
 	}
-	if err := validateIssueStrings(issue); err != nil {
-		return err
-	}
-	if err := validateCurrentTextBytes(issue); err != nil {
-		return err
-	}
-	if err := validateIssueVarchars(issue); err != nil {
-		return err
-	}
-	if err := checkCurrentInts(
-		currentInt{"issue estimated_minutes", x.estimatedMinutes},
-		currentInt{"issue compaction_level", x.compactionLevel},
-		currentInt{"issue original_size", x.originalSize},
-	); err != nil {
-		return err
-	}
+	return nil
+}
+
+// applyCanonicalTimestamps normalizes the required created_at/updated_at values
+// to the canonical current-schema representation.
+func (x legacyExtras) applyCanonicalTimestamps(issue *types.Issue) error {
+	var err error
 	if issue.CreatedAt, err = canonicalCurrentDatetime(issue.CreatedAt); err != nil {
 		return fmt.Errorf("legacy SQLite issue %s created_at: %w", issue.ID, err)
 	}
 	if issue.UpdatedAt, err = canonicalCurrentDatetime(issue.UpdatedAt); err != nil {
 		return fmt.Errorf("legacy SQLite issue %s updated_at: %w", issue.ID, err)
 	}
+	return nil
+}
+
+// checkRequiredScalars enforces the non-empty ID, non-tombstone status, and
+// present created_at/updated_at invariants every legacy issue must satisfy.
+func checkRequiredScalars(issue *types.Issue) error {
 	if issue.ID == "" {
 		return fmt.Errorf("legacy SQLite issue has empty ID")
 	}
@@ -491,6 +559,12 @@ func (x legacyExtras) validate(issue *types.Issue) error {
 	if issue.CreatedAt.IsZero() || issue.UpdatedAt.IsZero() {
 		return fmt.Errorf("legacy SQLite issue %s has invalid created_at or updated_at", issue.ID)
 	}
+	return nil
+}
+
+// checkRemovedFields rejects legacy rows that populate columns the current
+// schema no longer supports, then validates the tri-state boolean columns.
+func (x legacyExtras) checkRemovedFields(issue *types.Issue) error {
 	if x.closedBy != "" || x.deletedAt.Valid || nonempty(x.deletedBy, x.deleteReason, x.originalType, x.hookBead, x.roleBead, x.agentState, x.lastActivity) || x.crystallizes.Int64 != 0 || x.quality.Valid || x.roleType != "" || x.rig != "" || (issue.SourceRepo != "" && issue.SourceRepo != ".") {
 		return fmt.Errorf("legacy SQLite issue %s uses unsupported removed fields", issue.ID)
 	}
@@ -501,9 +575,6 @@ func (x legacyExtras) validate(issue *types.Issue) error {
 		if b.v.Valid && b.v.Int64 != 0 && b.v.Int64 != 1 {
 			return fmt.Errorf("issue %s has invalid %s boolean", issue.ID, b.name)
 		}
-	}
-	if err := issue.Validate(); err != nil {
-		return fmt.Errorf("legacy SQLite issue %s: %w", issue.ID, err)
 	}
 	return nil
 }
@@ -742,6 +813,19 @@ func loadChildren(ctx context.Context, db *sql.Tx, issues []*types.Issue) error 
 	for _, i := range issues {
 		byID[i.ID] = i
 	}
+	if err := loadLabels(ctx, db, byID); err != nil {
+		return err
+	}
+	if err := loadDependencies(ctx, db, byID); err != nil {
+		return err
+	}
+	if err := validateDependencyGraph(issues); err != nil {
+		return err
+	}
+	return loadComments(ctx, db, byID)
+}
+
+func loadLabels(ctx context.Context, db *sql.Tx, byID map[string]*types.Issue) error {
 	labels, err := db.QueryContext(ctx, "SELECT issue_id,label FROM labels ORDER BY issue_id,label")
 	if err != nil {
 		return err
@@ -770,9 +854,10 @@ func loadChildren(ctx context.Context, db *sql.Tx, issues []*types.Issue) error 
 		}
 		issue.Labels = append(issue.Labels, label)
 	}
-	if err := labels.Err(); err != nil {
-		return err
-	}
+	return labels.Err()
+}
+
+func loadDependencies(ctx context.Context, db *sql.Tx, byID map[string]*types.Issue) error {
 	deps, err := db.QueryContext(ctx, "SELECT issue_id,depends_on_id,type,CAST(created_at AS TEXT),created_by,metadata,thread_id FROM dependencies ORDER BY issue_id,depends_on_id,type")
 	if err != nil {
 		return err
@@ -780,64 +865,73 @@ func loadChildren(ctx context.Context, db *sql.Tx, issues []*types.Issue) error 
 	defer deps.Close()
 	seenDeps := make(map[string]bool)
 	for deps.Next() {
-		var id, to, typ, at, by string
-		var metadata, thread sql.NullString
-		if err := deps.Scan(&id, &to, &typ, &at, &by, &metadata, &thread); err != nil {
+		if err := appendLegacyDependencyRow(deps, byID, seenDeps); err != nil {
 			return err
 		}
-		if err := checkUTF8(
-			currentString{"dependency issue_id", id},
-			currentString{"dependency depends_on_id", to},
-			currentString{"dependency type", typ},
-			currentString{"dependency created_by", by},
-		); err != nil {
-			return err
-		}
-		if err := checkCurrentVarchars(
-			currentVarchar{"dependency issue_id", id, types.MaxFieldLen},
-			currentVarchar{"dependency depends_on_id", to, types.MaxFieldLen},
-			currentVarchar{"dependency type", typ, currentShortVarcharRunes},
-			currentVarchar{"dependency created_by", by, types.MaxFieldLen},
-		); err != nil {
-			return err
-		}
-		if by == "" {
-			return fmt.Errorf("dependency created_by is empty for %s -> %s", id, to)
-		}
-		issue := byID[id]
-		if issue == nil || byID[to] == nil {
-			return fmt.Errorf("orphan dependency %s -> %s", id, to)
-		}
-		if issue.Ephemeral != byID[to].Ephemeral {
-			return fmt.Errorf("dependency %s -> %s crosses ephemeral storage", id, to)
-		}
-		key := id + "\x00" + to
-		if seenDeps[key] {
-			return fmt.Errorf("multiple legacy dependencies for %s -> %s", id, to)
-		}
-		seenDeps[key] = true
-		created, e := parseTime(at)
-		if e != nil {
-			return e
-		}
-		if created.IsZero() {
-			return fmt.Errorf("dependency created_at is zero for %s -> %s", id, to)
-		}
-		if (metadata.Valid && metadata.String != "") || (thread.Valid && thread.String != "") {
-			return fmt.Errorf("dependency %s -> %s uses unsupported metadata or thread ID", id, to)
-		}
-		if !types.DependencyType(typ).IsValid() {
-			return fmt.Errorf("dependency %s -> %s has invalid type", id, to)
-		}
-		d := &types.Dependency{IssueID: id, DependsOnID: to, Type: types.DependencyType(typ), CreatedAt: created, CreatedBy: by, Metadata: nullString(metadata), ThreadID: nullString(thread)}
-		issue.Dependencies = append(issue.Dependencies, d)
 	}
-	if err := deps.Err(); err != nil {
+	return deps.Err()
+}
+
+// appendLegacyDependencyRow validates one legacy dependencies row and appends
+// the resulting edge to its owning issue. seenDeps carries the per-load
+// (issue_id, depends_on_id) set so duplicate legacy edges are rejected across
+// rows.
+func appendLegacyDependencyRow(deps *sql.Rows, byID map[string]*types.Issue, seenDeps map[string]bool) error {
+	var id, to, typ, at, by string
+	var metadata, thread sql.NullString
+	if err := deps.Scan(&id, &to, &typ, &at, &by, &metadata, &thread); err != nil {
 		return err
 	}
-	if err := validateDependencyGraph(issues); err != nil {
+	if err := checkUTF8(
+		currentString{"dependency issue_id", id},
+		currentString{"dependency depends_on_id", to},
+		currentString{"dependency type", typ},
+		currentString{"dependency created_by", by},
+	); err != nil {
 		return err
 	}
+	if err := checkCurrentVarchars(
+		currentVarchar{"dependency issue_id", id, types.MaxFieldLen},
+		currentVarchar{"dependency depends_on_id", to, types.MaxFieldLen},
+		currentVarchar{"dependency type", typ, currentShortVarcharRunes},
+		currentVarchar{"dependency created_by", by, types.MaxFieldLen},
+	); err != nil {
+		return err
+	}
+	if by == "" {
+		return fmt.Errorf("dependency created_by is empty for %s -> %s", id, to)
+	}
+	issue := byID[id]
+	if issue == nil || byID[to] == nil {
+		return fmt.Errorf("orphan dependency %s -> %s", id, to)
+	}
+	if issue.Ephemeral != byID[to].Ephemeral {
+		return fmt.Errorf("dependency %s -> %s crosses ephemeral storage", id, to)
+	}
+	key := id + "\x00" + to
+	if seenDeps[key] {
+		return fmt.Errorf("multiple legacy dependencies for %s -> %s", id, to)
+	}
+	seenDeps[key] = true
+	created, e := parseTime(at)
+	if e != nil {
+		return e
+	}
+	if created.IsZero() {
+		return fmt.Errorf("dependency created_at is zero for %s -> %s", id, to)
+	}
+	if (metadata.Valid && metadata.String != "") || (thread.Valid && thread.String != "") {
+		return fmt.Errorf("dependency %s -> %s uses unsupported metadata or thread ID", id, to)
+	}
+	if !types.DependencyType(typ).IsValid() {
+		return fmt.Errorf("dependency %s -> %s has invalid type", id, to)
+	}
+	d := &types.Dependency{IssueID: id, DependsOnID: to, Type: types.DependencyType(typ), CreatedAt: created, CreatedBy: by, Metadata: nullString(metadata), ThreadID: nullString(thread)}
+	issue.Dependencies = append(issue.Dependencies, d)
+	return nil
+}
+
+func loadComments(ctx context.Context, db *sql.Tx, byID map[string]*types.Issue) error {
 	comments, err := db.QueryContext(ctx, "SELECT id,issue_id,author,text,CAST(created_at AS TEXT) FROM comments ORDER BY issue_id,created_at,id")
 	if err != nil {
 		return err

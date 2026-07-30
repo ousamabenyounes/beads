@@ -578,7 +578,14 @@ migrate_schema_current() {
     local version="$1" label="$2" output
     output="$workspace/migrate-$label.out"
     run_in_workspace "$candidate" migrate schema > "$output" || die "$version: schema migration $label failed"
-    printf '✓ Schema already at v59\n' | cmp -s - "$output" ||
+    # The candidate's latest schema version advances as new migrations land
+    # (v59 -> v61 -> ...), so assert the no-op *shape* rather than a hardcoded
+    # version that silently goes stale on every schema bump and reddens this
+    # harness. A genuine no-op prints exactly "✓ Schema already at v<N>" on a
+    # single line; an incomplete upgrade would instead print
+    # "✓ Applied <n> schema migration(s); ...", which this exact-shape check
+    # rejects.
+    { [ "$(wc -l < "$output")" -eq 1 ] && grep -Eqx '✓ Schema already at v[0-9]+' "$output"; } ||
         die "$version: schema migration $label did not report the exact no-op output"
 }
 

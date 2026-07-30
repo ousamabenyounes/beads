@@ -70,48 +70,82 @@ func isHistoricalSQLiteWorkspace(beadsDir string, cfg *configfile.Config) bool {
 		return false
 	}
 	if cfg != nil {
-		if cfg.Backend != "" && cfg.Backend != configfile.BackendSQLite {
-			return false
-		}
-		if cfg.DoltMode != "" || cfg.DoltDatabase != "" {
-			return false
-		}
-		databaseName := cfg.SQLitePath
-		if databaseName == "" {
-			databaseName = cfg.Database
-		}
-		if databaseName == "" {
-			databaseName = "beads.db"
-		}
-		if filepath.Base(databaseName) != databaseName {
-			return false
-		}
-		return isNonEmptyRegularFile(filepath.Join(beadsDir, databaseName))
+		return configuredHistoricalSQLiteWorkspace(beadsDir, cfg)
 	}
+	return discoveredHistoricalSQLiteWorkspace(beadsDir)
+}
 
+// configuredHistoricalSQLiteWorkspace classifies a metadata-backed workspace
+// whose config names a bare on-disk SQLite database. It selects the database
+// name from the config exactly as legacy bd did and confirms the file exists
+// beneath beadsDir; a non-SQLite backend, any Dolt configuration, or a database
+// path that is not a plain basename all disqualify it.
+func configuredHistoricalSQLiteWorkspace(beadsDir string, cfg *configfile.Config) bool {
+	if cfg.Backend != "" && cfg.Backend != configfile.BackendSQLite {
+		return false
+	}
+	if cfg.DoltMode != "" || cfg.DoltDatabase != "" {
+		return false
+	}
+	databaseName := cfg.SQLitePath
+	if databaseName == "" {
+		databaseName = cfg.Database
+	}
+	if databaseName == "" {
+		databaseName = "beads.db"
+	}
+	if filepath.Base(databaseName) != databaseName {
+		return false
+	}
+	return isNonEmptyRegularFile(filepath.Join(beadsDir, databaseName))
+}
+
+// discoveredHistoricalSQLiteWorkspace classifies a metadata-less workspace by
+// its on-disk layout: exactly one non-empty regular .db file carrying a real
+// SQLite header, and no entries beyond that database, its WAL/SHM sidecars, an
+// optional issues.jsonl export, and an embeddeddolt directory.
+func discoveredHistoricalSQLiteWorkspace(beadsDir string) bool {
 	entries, err := os.ReadDir(beadsDir)
 	if err != nil {
 		return false
 	}
-	databaseName := ""
-	for _, entry := range entries {
-		if entry.Type()&os.ModeSymlink != 0 {
-			return false
-		}
-		name := entry.Name()
-		if strings.HasSuffix(name, ".db") {
-			if !isNonEmptyRegularFile(filepath.Join(beadsDir, name)) || databaseName != "" {
-				return false
-			}
-			databaseName = name
-		}
-	}
-	if databaseName == "" {
+	databaseName, ok := soleLegacySQLiteDatabase(beadsDir, entries)
+	if !ok {
 		return false
 	}
 	if !hasSQLiteHeader(filepath.Join(beadsDir, databaseName)) {
 		return false
 	}
+	return onlyLegacySQLiteEntries(beadsDir, entries, databaseName)
+}
+
+// soleLegacySQLiteDatabase returns the single .db filename directly beneath a
+// metadata-less workspace. It fails closed if any entry is a symlink, if a .db
+// file is empty or not a regular file, or if more than one .db file is present.
+func soleLegacySQLiteDatabase(beadsDir string, entries []os.DirEntry) (string, bool) {
+	databaseName := ""
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink != 0 {
+			return "", false
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".db") {
+			continue
+		}
+		if !isNonEmptyRegularFile(filepath.Join(beadsDir, name)) || databaseName != "" {
+			return "", false
+		}
+		databaseName = name
+	}
+	return databaseName, databaseName != ""
+}
+
+// onlyLegacySQLiteEntries reports whether every entry beneath a metadata-less
+// workspace belongs to the recognized legacy SQLite shape: the database file,
+// its WAL/SHM sidecars, an optional issues.jsonl export, and an embeddeddolt
+// directory. Any other entry, or an expected entry that is not a regular file,
+// disqualifies the workspace.
+func onlyLegacySQLiteEntries(beadsDir string, entries []os.DirEntry, databaseName string) bool {
 	for _, entry := range entries {
 		name := entry.Name()
 		if name == "embeddeddolt" && entry.IsDir() {

@@ -945,3 +945,48 @@ func authenticDDL() []string {
 		`CREATE TABLE comments (id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, author TEXT NOT NULL, text TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE)`,
 	}
 }
+
+// TestLoadIssuesProjectionArity guards the positional contract between
+// loadIssuesProjection and issueops.ScanIssueFrom. ScanIssueFrom appends the
+// legacy trailing dests through a variadic `...any`, so a column added to the
+// canonical issueops.IssueSelectColumns without a matching NULL/0 placeholder in
+// loadIssuesProjection still compiles and only fails at runtime, mid-migration
+// (exactly the storage_class drift this test was written for). Asserting the
+// column counts agree turns that drift into a test failure instead.
+func TestLoadIssuesProjectionArity(t *testing.T) {
+	canonical := topLevelColumns(issueops.IssueSelectColumns)
+	trailing := len((&legacyExtras{}).scanDests())
+	got := topLevelColumns(loadIssuesProjection)
+	if want := canonical + trailing; got != want {
+		t.Fatalf("loadIssuesProjection selects %d columns but ScanIssueFrom scans %d "+
+			"(%d canonical issueops.IssueSelectColumns + %d legacy trailing dests); "+
+			"a canonical column was likely added without a matching NULL/0 placeholder in loadIssuesProjection",
+			got, want, canonical, trailing)
+	}
+}
+
+// topLevelColumns counts the comma-separated columns in a SQL projection,
+// ignoring commas nested inside parenthesized expressions such as
+// CAST(x AS TEXT).
+func topLevelColumns(projection string) int {
+	depth, start, count := 0, 0, 0
+	for i, r := range projection {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				if strings.TrimSpace(projection[start:i]) != "" {
+					count++
+				}
+				start = i + 1
+			}
+		}
+	}
+	if strings.TrimSpace(projection[start:]) != "" {
+		count++
+	}
+	return count
+}
