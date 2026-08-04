@@ -603,7 +603,7 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency
 		return err
 	}
 
-	return wrapSQLCommitError("commit add wisp dependency", tx.Commit())
+	return s.commitSQLTx(ctx, "commit add wisp dependency", tx)
 }
 
 // getWispDependencies retrieves issues that a wisp depends on.

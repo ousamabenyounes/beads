@@ -9,18 +9,22 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/types"
 )
 
-// dependencyCommitBoundaryDriver models dependency removal through its SQL
+// dependencyCommitBoundaryDriver models dependency writes through their SQL
 // mutation and transaction commit. A lost commit response is returned after
-// the delete so an unsafe replay is visible as a second mutation attempt.
+// the mutation so an unsafe replay is visible as a second attempt.
 type dependencyCommitBoundaryDriver struct {
 	mu sync.Mutex
 
 	activeWisp bool
 	commitErr  error
+	newEdge    bool
 
 	deletes     int
+	inserts     int
 	txAttempts  int
 	commitCalls int
 }
@@ -62,8 +66,13 @@ func (c *dependencyCommitBoundaryConn) QueryContext(_ context.Context, query str
 			return &dependencyCommitBoundaryRows{columns: []string{"exists"}, values: [][]driver.Value{{int64(1)}}}, nil
 		}
 		return &dependencyCommitBoundaryRows{columns: []string{"exists"}}, nil
+	case strings.Contains(query, "SELECT issue_type FROM wisps WHERE id = ?"):
+		return &dependencyCommitBoundaryRows{columns: []string{"issue_type"}, values: [][]driver.Value{{"task"}}}, nil
 	case strings.Contains(query, "SELECT type FROM dependencies"),
 		strings.Contains(query, "SELECT type FROM wisp_dependencies"):
+		if c.driver.newEdge {
+			return &dependencyCommitBoundaryRows{columns: []string{"type"}}, nil
+		}
 		return &dependencyCommitBoundaryRows{columns: []string{"type"}, values: [][]driver.Value{{"related"}}}, nil
 	default:
 		return &dependencyCommitBoundaryRows{columns: []string{"value"}}, nil
@@ -75,6 +84,9 @@ func (c *dependencyCommitBoundaryConn) ExecContext(_ context.Context, query stri
 	defer c.driver.mu.Unlock()
 	if strings.Contains(query, "DELETE FROM dependencies") || strings.Contains(query, "DELETE FROM wisp_dependencies") {
 		c.driver.deletes++
+	}
+	if strings.Contains(query, "INSERT INTO wisp_dependencies") {
+		c.driver.inserts++
 	}
 	return driver.RowsAffected(1), nil
 }
@@ -149,6 +161,60 @@ func TestRemoveDependencySQLCommitResponseLossIsIndeterminateAndNotReplayed(t *t
 				t.Fatalf("circuit state after one lost response = %+v, want closed with one failure", state)
 			}
 		})
+	}
+}
+
+func TestAddExplicitIDWispDependencyIndeterminateCommitTripsCircuitBeforeNextWrite(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	breaker := newTestCircuitBreaker(t)
+	for range circuitFailureThreshold - 1 {
+		breaker.RecordFailure()
+	}
+	driver := &dependencyCommitBoundaryDriver{
+		activeWisp: true,
+		commitErr:  testConnectionLoss,
+		newEdge:    true,
+	}
+	store := &DoltStore{db: sql.OpenDB(driver), breaker: breaker}
+	t.Cleanup(func() { _ = store.db.Close() })
+
+	dep := &types.Dependency{
+		IssueID:     "explicit-source",
+		DependsOnID: "explicit-target",
+		Type:        types.DepRelated,
+	}
+	err := store.AddDependency(t.Context(), dep, "alice")
+	if !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("AddDependency() error = %v, want ErrCommitIndeterminate", err)
+	}
+	if !errors.Is(err, testConnectionLoss) {
+		t.Fatalf("AddDependency() error = %v, want cause %v", err, testConnectionLoss)
+	}
+	if state := breaker.State(); state != circuitOpen {
+		t.Fatalf("circuit state after indeterminate wisp dependency commit = %q, want %q", state, circuitOpen)
+	}
+
+	driver.mu.Lock()
+	beforeTx := driver.txAttempts
+	beforeInserts := driver.inserts
+	commitCalls := driver.commitCalls
+	driver.mu.Unlock()
+	if beforeTx != 1 || commitCalls != 1 || beforeInserts != 1 {
+		t.Fatalf("first write attempts = transactions:%d commits:%d inserts:%d, want 1 each",
+			beforeTx, commitCalls, beforeInserts)
+	}
+
+	err = store.AddDependency(t.Context(), dep, "alice")
+	if !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("next AddDependency() error = %v, want ErrCircuitOpen", err)
+	}
+	driver.mu.Lock()
+	afterTx := driver.txAttempts
+	afterInserts := driver.inserts
+	driver.mu.Unlock()
+	if afterTx != beforeTx || afterInserts != beforeInserts {
+		t.Fatalf("writes after circuit trip = transactions:%d inserts:%d, want unchanged %d and %d",
+			afterTx, afterInserts, beforeTx, beforeInserts)
 	}
 }
 
