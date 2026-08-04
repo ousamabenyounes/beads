@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -23,16 +24,22 @@ type claimCommitBoundaryDriver struct {
 	stageErr        error
 	commitErr       error
 	nothingToCommit bool
+	checkedUpdate   bool
+	verifyAssignee  string
+	verifyStatus    types.Status
 
-	claimMutations int
-	claimedIDs     []string
-	stageCalls     int
-	doltCommits    int
-	txCommits      int
-	txRollbacks    int
-	txAttempts     int
-	activeID       string
-	readyIDs       []string
+	claimMutations  int
+	claimedIDs      []string
+	updateMutations int
+	eventInserts    int
+	claimStateReads int
+	stageCalls      int
+	doltCommits     int
+	txCommits       int
+	txRollbacks     int
+	txAttempts      int
+	activeID        string
+	readyIDs        []string
 }
 
 func (d *claimCommitBoundaryDriver) Open(string) (driver.Conn, error) {
@@ -77,6 +84,18 @@ func (c *claimCommitBoundaryConn) QueryContext(_ context.Context, query string, 
 	switch {
 	case strings.Contains(query, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1"):
 		return &claimCommitBoundaryRows{columns: []string{"exists"}}, nil
+	case strings.Contains(query, "SELECT assignee, status FROM issues WHERE id = ?"):
+		c.driver.claimStateReads++
+		assignee := ""
+		status := types.StatusOpen
+		if c.driver.checkedUpdate && c.driver.claimStateReads > 1 {
+			assignee = c.driver.verifyAssignee
+			status = c.driver.verifyStatus
+		}
+		return &claimCommitBoundaryRows{
+			columns: []string{"assignee", "status"},
+			values:  [][]driver.Value{{assignee, string(status)}},
+		}, nil
 	case strings.Contains(query, "SELECT id FROM issues"):
 		return &claimCommitBoundaryRows{
 			columns: []string{"id"},
@@ -126,6 +145,12 @@ func (c *claimCommitBoundaryConn) ExecContext(_ context.Context, query string, _
 	if strings.Contains(query, "UPDATE issues") && strings.Contains(query, "SET assignee") {
 		c.driver.claimMutations++
 		c.driver.claimedIDs = append(c.driver.claimedIDs, c.driver.activeID)
+	}
+	if strings.Contains(query, "UPDATE issues") && strings.Contains(query, "`title`") {
+		c.driver.updateMutations++
+	}
+	if strings.Contains(query, "INSERT INTO events") {
+		c.driver.eventInserts++
 	}
 	return driver.RowsAffected(1), nil
 }
@@ -278,6 +303,44 @@ func TestClaimReadyIssueDoltCommitResponseLossDoesNotDoubleClaim(t *testing.T) {
 	}
 	if driver.doltCommits != 1 {
 		t.Fatalf("DOLT_COMMIT calls = %d, want 1", driver.doltCommits)
+	}
+}
+
+func TestUpdateIssueCheckedMixedCoordinationCommitLossIsNotMasked(t *testing.T) {
+	driver := &claimCommitBoundaryDriver{
+		commitErr:      testConnectionLoss,
+		checkedUpdate:  true,
+		verifyAssignee: "alice",
+		verifyStatus:   types.StatusInProgress,
+	}
+	store := newClaimCommitBoundaryStore(driver)
+	store.serverMode = true
+	t.Cleanup(func() { _ = store.db.Close() })
+
+	expectedAssignee := ""
+	expectedStatus := string(types.StatusOpen)
+	err := store.UpdateIssueChecked(context.Background(), "claim-boundary", map[string]interface{}{
+		"assignee": "alice",
+		"status":   string(types.StatusInProgress),
+		"title":    "ordinary field must not be masked",
+	}, "alice", storage.UpdateIssueOptions{
+		ExpectedAssignee: &expectedAssignee,
+		ExpectedStatus:   &expectedStatus,
+	})
+	if !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("UpdateIssueChecked() error = %v, want ErrCommitIndeterminate", err)
+	}
+	if !errors.Is(err, testConnectionLoss) {
+		t.Fatalf("UpdateIssueChecked() error = %v, want cause %v", err, testConnectionLoss)
+	}
+
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	if driver.updateMutations != 1 || driver.eventInserts != 1 {
+		t.Fatalf("mixed update attempts = updates:%d events:%d, want updates:1 events:1", driver.updateMutations, driver.eventInserts)
+	}
+	if driver.txAttempts != 1 || driver.doltCommits != 1 || driver.txRollbacks != 1 {
+		t.Fatalf("transaction outcomes = attempts:%d Dolt commits:%d rollbacks:%d, want 1, 1, 1", driver.txAttempts, driver.doltCommits, driver.txRollbacks)
 	}
 }
 

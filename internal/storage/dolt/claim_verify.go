@@ -81,24 +81,21 @@ func unclaimed() claimPostcondition {
 // guardedUpdatePostcondition derives the postcondition for a guarded update
 // (bd-wsqvw: UpdateIssueOptions.ExpectedAssignee/ExpectedStatus) that writes
 // the coordination fields. ok is false — no verification — when the update
-// carries no guard, or when it guards but writes neither assignee nor status
-// (a guarded edit of ordinary fields is not claim-family: a lost notes edit is
-// an annoyance, not a phantom claim). The postcondition checks only the
-// coordination fields the update actually sets, since the others may be
-// legitimately touched by concurrent writers.
-//
-// Attribution narrowness (lion review, PR #5008): because only the SET
-// coordination fields are checked, a commit-phase loss whose transaction
-// verifiably rolled back can still verify as "applied" when a racing actor
-// landed the SAME target values inside the verify window. The coordination
-// state is then correct but it is the racer's write, not ours: any ordinary
-// fields riding the same update (title, notes, …) and our event row are
-// silently gone despite the reported success. Mitigation is usage-side, not
-// machinery: keep guarded coordination writes single-purpose (assignee/status
-// only), which is how the wheelhouse park/restore consumers use them.
+// carries no guard, when it guards but writes neither assignee nor status, or
+// when ordinary fields ride alongside the coordination write. Verification
+// reads only assignee/status, so it cannot prove that a mixed update (or its
+// event) landed; such a write must retain ErrCommitIndeterminate instead of
+// turning a matching coordination state into false success. For a
+// coordination-only update, the postcondition checks every field requested by
+// the caller while allowing other coordination fields to change concurrently.
 func guardedUpdatePostcondition(opts storage.UpdateIssueOptions, updates map[string]interface{}) (claimPostcondition, bool) {
 	if opts.ExpectedAssignee == nil && opts.ExpectedStatus == nil {
 		return claimPostcondition{}, false
+	}
+	for field := range updates {
+		if field != "assignee" && field != "status" {
+			return claimPostcondition{}, false
+		}
 	}
 	newAssignee, setsAssignee := updates["assignee"].(string)
 	newStatus, setsStatus := updates["status"].(string)
