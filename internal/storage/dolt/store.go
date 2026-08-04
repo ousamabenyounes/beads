@@ -2904,7 +2904,7 @@ func (s *DoltStore) commitWorkingSet(ctx context.Context, message string, mode c
 		if isDoltNothingToCommit(err) {
 			return nil
 		}
-		return wrapSQLCommitError("failed to commit", err)
+		return s.wrapDoltPublicationFailure(ctx, "failed to commit", err)
 	}
 
 	return nil
@@ -2930,7 +2930,7 @@ func (s *DoltStore) concludeOpenMerge(ctx context.Context, conn *sql.Conn, messa
 		if isDoltNothingToCommit(err) {
 			return nil
 		}
-		return wrapSQLCommitError("failed to conclude merge", err)
+		return s.wrapDoltPublicationFailure(ctx, "failed to conclude merge", err)
 	}
 	return nil
 }
@@ -2992,7 +2992,7 @@ func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error 
 		if isDoltNothingToCommit(err) {
 			return nil
 		}
-		return wrapSQLCommitError("failed to commit", err)
+		return s.wrapDoltPublicationFailure(ctx, "failed to commit", err)
 	}
 	return nil
 }
@@ -3024,10 +3024,13 @@ func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commi
 	return nil
 }
 
-// recordDoltPublicationFailure accounts for a connection loss after a durable
-// SQL write. doltAddAndCommit is intentionally outside withRetry: replaying it
-// could publish an already-applied write, so this is the single accounting
-// boundary for those direct publication failures.
+func (s *DoltStore) wrapDoltPublicationFailure(ctx context.Context, op string, err error) error {
+	return s.recordDoltPublicationFailure(ctx, wrapSQLCommitError(op, err))
+}
+
+// recordDoltPublicationFailure accounts once for an ambiguous connection loss
+// at a direct Dolt publication boundary. These paths deliberately stay outside
+// withRetry because replay could report an already-applied commit as a new one.
 func (s *DoltStore) recordDoltPublicationFailure(ctx context.Context, err error) error {
 	if s.breaker == nil || !errors.Is(err, ErrCommitIndeterminate) || !isConnectionError(err) {
 		return err

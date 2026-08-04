@@ -292,6 +292,90 @@ func TestCommitPropagatesDoltAddFailureBeforeCommit(t *testing.T) {
 	}
 }
 
+func TestPublicCommitAmbiguousConnectionFailuresTripCircuit(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	tests := []struct {
+		name   string
+		expect func(sqlmock.Sqlmock)
+		commit func(*DoltStore) error
+	}{
+		{
+			name: "Commit",
+			expect: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM dolt_status")).
+					WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("issues"))
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+					WithArgs("issues").
+					WillReturnRows(sqlmock.NewRows([]string{"status"}))
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
+					WithArgs("bd: test commit", " <>").
+					WillReturnError(testConnectionLoss)
+			},
+			commit: func(store *DoltStore) error {
+				return store.Commit(context.Background(), "bd: test commit")
+			},
+		},
+		{
+			name: "CommitMergeResolution",
+			expect: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM dolt_status")).
+					WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("issues"))
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+					WithArgs("issues").
+					WillReturnRows(sqlmock.NewRows([]string{"status"}))
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
+					WithArgs("bd: test merge commit", " <>").
+					WillReturnError(testConnectionLoss)
+			},
+			commit: func(store *DoltStore) error {
+				return store.CommitMergeResolution(context.Background(), "bd: test merge commit")
+			},
+		},
+		{
+			name: "CommitWithConfig",
+			expect: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")).
+					WithArgs("bd: test config commit", " <>").
+					WillReturnError(testConnectionLoss)
+			},
+			commit: func(store *DoltStore) error {
+				return store.CommitWithConfig(context.Background(), "bd: test config commit")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			for range circuitFailureThreshold {
+				tt.expect(mock)
+			}
+
+			breaker := newTestCircuitBreaker(t)
+			store := &DoltStore{db: db, breaker: breaker}
+			for i := 0; i < circuitFailureThreshold; i++ {
+				err := tt.commit(store)
+				if !errors.Is(err, ErrCommitIndeterminate) {
+					t.Fatalf("attempt %d error = %v, want ErrCommitIndeterminate", i+1, err)
+				}
+				if i < circuitFailureThreshold-1 && breaker.State() != circuitClosed {
+					t.Fatalf("circuit state after %d failures = %q, want %q", i+1, breaker.State(), circuitClosed)
+				}
+			}
+			if state := breaker.State(); state != circuitOpen {
+				t.Fatalf("circuit state after %d ambiguous commit failures = %q, want %q", circuitFailureThreshold, state, circuitOpen)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet sqlmock expectations: %v", err)
+			}
+		})
+	}
+}
+
 func TestDoltAddAndCommitInTxClassifiesCommitResponses(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
