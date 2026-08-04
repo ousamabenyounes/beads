@@ -80,14 +80,14 @@ func (o *issueOperations) verifiedUpdate(ctx context.Context, request issueops.U
 // behind to count as applied, and whether that state is enough to prove the
 // whole update. A claim is verifiable only when its patch changes no state
 // beyond assignee and status. An ordinary update is verifiable only when a
-// compare-and-set guard authorizes a write to assignee or status. The
-// postcondition honors a coordination-only claim patch that overrides the
-// claim's own assignee or status.
+// compare-and-set guard authorizes a coordination-only write. The postcondition
+// honors a coordination-only claim patch that overrides the claim's own
+// assignee or status.
 func updateClaimPostcondition(request issueops.UpdateRequest) (claimPostcondition, bool) {
+	if hasNonCoordinationPatch(request.Patch) {
+		return claimPostcondition{}, false
+	}
 	if request.Claim {
-		if hasNonCoordinationClaimPatch(request.Patch) {
-			return claimPostcondition{}, false
-		}
 		assignee, status := request.Actor, types.StatusInProgress
 		if request.Patch.Assignee.Set {
 			assignee = request.Patch.Assignee.Value
@@ -96,9 +96,6 @@ func updateClaimPostcondition(request issueops.UpdateRequest) (claimPostconditio
 			status = request.Patch.Status.Value
 		}
 		return claimedAs(assignee, status), true
-	}
-	if request.Patch.Persistence.Set {
-		return claimPostcondition{}, false
 	}
 	updates := map[string]interface{}{}
 	if request.Patch.Assignee.Set {
@@ -115,10 +112,10 @@ func updateClaimPostcondition(request issueops.UpdateRequest) (claimPostconditio
 	return guardedUpdatePostcondition(opts, updates)
 }
 
-// hasNonCoordinationClaimPatch reports whether a claim also changes state that
-// an assignee/status re-read cannot prove. Keep this explicit so every patch
+// hasNonCoordinationPatch reports whether an update also changes state that an
+// assignee/status re-read cannot prove. Keep this explicit so every patch
 // operation is visibly classified without making the request shape reflective.
-func hasNonCoordinationClaimPatch(patch issueops.IssuePatch) bool {
+func hasNonCoordinationPatch(patch issueops.IssuePatch) bool {
 	return patch.Title.Set ||
 		patch.Description.Set ||
 		patch.Design.Set ||
