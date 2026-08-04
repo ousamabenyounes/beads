@@ -157,6 +157,38 @@ func TestDoltAddAndCommitPostSQLFailuresAreIndeterminate(t *testing.T) {
 	}
 }
 
+func TestDoltAddAndCommitAmbiguousConnectionFailuresTripCircuitOnce(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	for range circuitFailureThreshold {
+		mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+			WithArgs("issues").
+			WillReturnError(testConnectionLoss)
+	}
+
+	breaker := newTestCircuitBreaker(t)
+	store := &DoltStore{db: db, breaker: breaker}
+	for i := 0; i < circuitFailureThreshold; i++ {
+		err := store.doltAddAndCommit(context.Background(), []string{"issues"}, "bd: test commit")
+		if !errors.Is(err, ErrCommitIndeterminate) {
+			t.Fatalf("attempt %d error = %v, want ErrCommitIndeterminate", i+1, err)
+		}
+		if i < circuitFailureThreshold-1 && breaker.State() != circuitClosed {
+			t.Fatalf("circuit state after %d failures = %q, want %q", i+1, breaker.State(), circuitClosed)
+		}
+	}
+	if state := breaker.State(); state != circuitOpen {
+		t.Fatalf("circuit state after %d ambiguous publication failures = %q, want %q", circuitFailureThreshold, state, circuitOpen)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 func TestDoltAddAndCommitTreatsNothingToCommitAsSuccess(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
@@ -174,6 +206,59 @@ func TestDoltAddAndCommitTreatsNothingToCommitAsSuccess(t *testing.T) {
 	store := &DoltStore{db: db}
 	if err := store.doltAddAndCommit(context.Background(), []string{"issues"}, "bd: test commit"); err != nil {
 		t.Fatalf("doltAddAndCommit() error = %v, want nil", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestCommitWithConfigCommitResponseLossIsIndeterminate(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")).
+		WithArgs("bd: test config commit", " <>").
+		WillReturnError(testConnectionLoss)
+
+	store := &DoltStore{db: db}
+	err = store.CommitWithConfig(context.Background(), "bd: test config commit")
+	if !errors.Is(err, storage.ErrCommitIndeterminate) {
+		t.Fatalf("CommitWithConfig() error = %v, want ErrCommitIndeterminate", err)
+	}
+	if !errors.Is(err, testConnectionLoss) {
+		t.Fatalf("CommitWithConfig() error = %v, want cause %v", err, testConnectionLoss)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestCommitCommitResponseLossIsIndeterminate(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM dolt_status")).
+		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("issues"))
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+		WithArgs("issues").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
+		WithArgs("bd: test commit", " <>").
+		WillReturnError(testConnectionLoss)
+
+	store := &DoltStore{db: db}
+	err = store.Commit(context.Background(), "bd: test commit")
+	if !errors.Is(err, storage.ErrCommitIndeterminate) {
+		t.Fatalf("Commit() error = %v, want ErrCommitIndeterminate", err)
+	}
+	if !errors.Is(err, testConnectionLoss) {
+		t.Fatalf("Commit() error = %v, want cause %v", err, testConnectionLoss)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sqlmock expectations: %v", err)

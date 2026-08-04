@@ -2899,7 +2899,7 @@ func (s *DoltStore) commitWorkingSet(ctx context.Context, message string, mode c
 		if isDoltNothingToCommit(err) {
 			return nil
 		}
-		return fmt.Errorf("failed to commit: %w", err)
+		return wrapSQLCommitError("failed to commit", err)
 	}
 
 	return nil
@@ -2925,7 +2925,7 @@ func (s *DoltStore) concludeOpenMerge(ctx context.Context, conn *sql.Conn, messa
 		if isDoltNothingToCommit(err) {
 			return nil
 		}
-		return fmt.Errorf("failed to conclude merge: %w", err)
+		return wrapSQLCommitError("failed to conclude merge", err)
 	}
 	return nil
 }
@@ -2987,7 +2987,7 @@ func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error 
 		if isDoltNothingToCommit(err) {
 			return nil
 		}
-		return fmt.Errorf("failed to commit: %w", err)
+		return wrapSQLCommitError("failed to commit", err)
 	}
 	return nil
 }
@@ -3000,20 +3000,39 @@ func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error 
 func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commitMsg string) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire connection after SQL mutation: %w: %w", err, ErrCommitIndeterminate)
+		return s.recordDoltPublicationFailure(ctx,
+			fmt.Errorf("acquire connection after SQL mutation: %w: %w", err, ErrCommitIndeterminate))
 	}
 	defer conn.Close()
 
 	for _, table := range tables {
 		if err := schema.DrainCall(ctx, conn, "CALL DOLT_ADD(?)", table); err != nil {
-			return fmt.Errorf("dolt add %s after SQL mutation: %w: %w", table, err, ErrCommitIndeterminate)
+			return s.recordDoltPublicationFailure(ctx,
+				fmt.Errorf("dolt add %s after SQL mutation: %w: %w", table, err, ErrCommitIndeterminate))
 		}
 	}
 	if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-		return fmt.Errorf("dolt commit after SQL mutation: %w: %w", err, ErrCommitIndeterminate)
+		return s.recordDoltPublicationFailure(ctx,
+			fmt.Errorf("dolt commit after SQL mutation: %w: %w", err, ErrCommitIndeterminate))
 	}
 	return nil
+}
+
+// recordDoltPublicationFailure accounts for a connection loss after a durable
+// SQL write. doltAddAndCommit is intentionally outside withRetry: replaying it
+// could publish an already-applied write, so this is the single accounting
+// boundary for those direct publication failures.
+func (s *DoltStore) recordDoltPublicationFailure(ctx context.Context, err error) error {
+	if s.breaker == nil || !errors.Is(err, ErrCommitIndeterminate) || !isConnectionError(err) {
+		return err
+	}
+	s.breaker.RecordFailure()
+	if s.breaker.State() == circuitOpen {
+		doltMetrics.circuitTrips.Add(ctx, 1)
+		return fmt.Errorf("%w (circuit breaker tripped)", err)
+	}
+	return err
 }
 
 // HasCommittablePending reports whether the working set holds committable

@@ -24,7 +24,7 @@ func (s *DoltStore) AddComment(ctx context.Context, issueID, actor, comment stri
 		return err
 	}
 	if err := tx.Commit(); err != nil {
-		return wrapTransactionError("commit add comment event", err)
+		return wrapSQLCommitError("commit add comment event", err)
 	}
 	if isWisp {
 		return nil
