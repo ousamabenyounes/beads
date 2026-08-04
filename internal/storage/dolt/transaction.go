@@ -103,16 +103,42 @@ func (s *DoltStore) runInTransaction(
 // RunInIssueLifecycleTransaction runs a lifecycle transition and its durable
 // side effects through one SQL transaction and one Dolt commit attempt.
 func (s *DoltStore) RunInIssueLifecycleTransaction(ctx context.Context, commitMsg string, fn func(tx storage.IssueLifecycleTransaction) error) error {
-	return s.withRetryTx(ctx, func(sqlTx *sql.Tx) error {
-		tx := &doltTransaction{regularTx: sqlTx, ignoredTx: sqlTx, store: s, lifecycle: true}
-		if err := fn(tx); err != nil {
-			return err
+	return s.runInIssueLifecycleTransaction(ctx, commitMsg, fn, s.withWriteTx)
+}
+
+// runInIssueLifecycleTransaction retries only failures that occur before the
+// public callback starts. Once fn has run, its caller-owned work must never be
+// replayed, even when Dolt proves that the SQL transaction rolled back.
+func (s *DoltStore) runInIssueLifecycleTransaction(
+	ctx context.Context,
+	commitMsg string,
+	fn func(tx storage.IssueLifecycleTransaction) error,
+	run func(context.Context, func(*sql.Tx) error) error,
+) error {
+	return s.withRetry(ctx, func() error {
+		invoked := false
+		var callbackErr error
+		err := run(ctx, func(sqlTx *sql.Tx) error {
+			invoked = true
+			tx := &doltTransaction{regularTx: sqlTx, ignoredTx: sqlTx, store: s, lifecycle: true}
+			if callbackErr = fn(tx); callbackErr != nil {
+				return callbackErr
+			}
+			tables := tx.dirtyTableNames()
+			if len(tables) == 0 {
+				return nil
+			}
+			return s.doltAddAndCommitInTx(ctx, sqlTx, tables, commitMsg)
+		})
+		if invoked && err != nil {
+			// An ambiguous commit reaches withRetry so connection failures still
+			// count toward the circuit breaker, but it is never replayed.
+			if callbackErr == nil && errors.Is(err, ErrCommitIndeterminate) {
+				return err
+			}
+			return backoff.Permanent(err)
 		}
-		tables := tx.dirtyTableNames()
-		if len(tables) == 0 {
-			return nil
-		}
-		return s.doltAddAndCommitInTx(ctx, sqlTx, tables, commitMsg)
+		return err
 	})
 }
 

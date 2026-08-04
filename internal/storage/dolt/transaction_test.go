@@ -43,6 +43,40 @@ func TestRunInTransactionCallbackConnectionErrorIsNotReplayed(t *testing.T) {
 	}
 }
 
+// TestRunInIssueLifecycleTransactionRollbackDoesNotReplayCallback keeps the
+// public lifecycle callback outside withRetryTx's rollback-safe retry loop.
+// The SQL transaction may safely be retried internally elsewhere, but this
+// callback can perform caller-owned work and therefore runs at most once.
+func TestRunInIssueLifecycleTransactionRollbackDoesNotReplayCallback(t *testing.T) {
+	rollback := &mysql.MySQLError{
+		Number:  1105,
+		Message: "Merge conflict detected, @autocommit transaction rolled back",
+	}
+	store := &DoltStore{}
+	calls := 0
+	runnerCalls := 0
+
+	err := store.runInIssueLifecycleTransaction(context.Background(), "test: lifecycle callback at most once", func(storage.IssueLifecycleTransaction) error {
+		calls++
+		return nil
+	}, func(_ context.Context, fn func(*sql.Tx) error) error {
+		runnerCalls++
+		if err := fn(nil); err != nil {
+			return err
+		}
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		t.Fatalf("RunInIssueLifecycleTransaction() error = %v, want %v", err, rollback)
+	}
+	if calls != 1 {
+		t.Fatalf("lifecycle callback calls = %d, want 1", calls)
+	}
+	if runnerCalls != 1 {
+		t.Fatalf("lifecycle transaction attempts = %d, want 1", runnerCalls)
+	}
+}
+
 // TestRunInTransactionSerializationConflictInvokesCallbacksOnce orders two
 // independent handles so the stale transaction loses at commit. The public
 // callbacks must still each run once, and the winner's content must survive.
