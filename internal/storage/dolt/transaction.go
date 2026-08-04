@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
+
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/issueops"
@@ -59,13 +61,23 @@ func (t *doltTransaction) CreateIssueImport(ctx context.Context, issue *types.Is
 	return t.CreateIssue(ctx, issue, actor)
 }
 
-// RunInTransaction executes a function within a database transaction.
-// The commitMsg is used for the DOLT_COMMIT that occurs inside the transaction,
-// making the write atomically visible in Dolt's version history.
-// Wisp routing is handled within individual transaction methods based on ID/Ephemeral flag.
+// RunInTransaction executes a function within a database transaction. Its
+// callback is invoked at most once per call; callers retry explicitly after a
+// callback has started when their operation is safe to repeat. The commitMsg is
+// used for the DOLT_COMMIT that makes regular writes visible in Dolt history.
+// Wisp routing is handled by individual transaction methods based on
+// ID/Ephemeral.
 func (s *DoltStore) RunInTransaction(ctx context.Context, commitMsg string, fn func(tx storage.Transaction) error) error {
 	return s.withRetry(ctx, func() error {
-		return s.runDoltTransaction(ctx, commitMsg, fn)
+		invoked := false
+		err := s.runDoltTransaction(ctx, commitMsg, func(tx storage.Transaction) error {
+			invoked = true
+			return fn(tx)
+		})
+		if invoked && err != nil {
+			return backoff.Permanent(err)
+		}
+		return err
 	})
 }
 
@@ -159,18 +171,31 @@ func (s *DoltStore) runDoltTransaction(ctx context.Context, commitMsg string, fn
 		return err
 	}
 
-	if err := regularTx.Commit(); err != nil {
-		_ = ignoredTx.Rollback()
+	return s.finishDoltTransaction(ctx, conn, tx, commitMsg)
+}
+
+// finishDoltTransaction commits the regular SQL transaction, its associated
+// Dolt revision, and then the ignored-table transaction. Once the regular SQL
+// transaction succeeds, later failures have an indeterminate durable outcome.
+func (s *DoltStore) finishDoltTransaction(ctx context.Context, conn *sql.Conn, tx *doltTransaction, commitMsg string) error {
+	if err := tx.regularTx.Commit(); err != nil {
+		_ = tx.ignoredTx.Rollback()
+		if isSerializationError(err) {
+			return fmt.Errorf("sql commit (regular): %w", err)
+		}
+		if isIndeterminateCommitResponse(err) {
+			return fmt.Errorf("sql commit (regular): %w: %w", err, ErrCommitIndeterminate)
+		}
 		return fmt.Errorf("sql commit (regular): %w", err)
 	}
 
 	if err := versioncontrolops.StageAndCommit(ctx, conn, tx.dirty.DirtyTables(), commitMsg, s.commitAuthorString()); err != nil {
-		_ = ignoredTx.Rollback()
-		return err
+		_ = tx.ignoredTx.Rollback()
+		return fmt.Errorf("stage and commit after regular SQL commit: %w: %w", err, ErrCommitIndeterminate)
 	}
 
-	if err := ignoredTx.Commit(); err != nil {
-		return fmt.Errorf("sql commit (ignored, regular already committed): %w", err)
+	if err := tx.ignoredTx.Commit(); err != nil {
+		return fmt.Errorf("sql commit (ignored, regular already committed): %w: %w", err, ErrCommitIndeterminate)
 	}
 	return nil
 }

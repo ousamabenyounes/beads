@@ -82,8 +82,8 @@ func TestIndeterminateCommitIsSurfacedNotRetried(t *testing.T) {
 	if err == nil {
 		t.Fatal("lost commit returned nil; indeterminacy must be surfaced")
 	}
-	if !errors.Is(err, errCommitPhase) {
-		t.Errorf("err = %v, want errCommitPhase", err)
+	if !errors.Is(err, ErrCommitIndeterminate) {
+		t.Errorf("err = %v, want ErrCommitIndeterminate", err)
 	}
 	if !strings.Contains(err.Error(), "indeterminate") {
 		t.Errorf("err = %q, want indeterminate outcome", err)

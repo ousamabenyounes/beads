@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,24 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 )
+
+func TestIsIndeterminateCommitResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "unexpected EOF", err: io.ErrUnexpectedEOF, want: true},
+		{name: "lost connection", err: errors.New("lost connection to MySQL server"), want: true},
+		{name: "typed semantic MySQL error", err: &mysql.MySQLError{Number: 1105, Message: "connection lost while validating commit"}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isIndeterminateCommitResponse(tc.err); got != tc.want {
+				t.Errorf("isIndeterminateCommitResponse(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
 
 func TestWrapDBError(t *testing.T) {
 	t.Run("nil error returns nil", func(t *testing.T) {

@@ -1024,6 +1024,11 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 			doltMetrics.writeRetries.Add(ctx, 1, metric.WithAttributes(attribute.String("type", "serialization")))
 			return err
 		}
+		// A commit result marked indeterminate may have landed before its
+		// response was lost. Never replay the callback in that case.
+		if errors.Is(err, ErrCommitIndeterminate) {
+			return backoff.Permanent(fmt.Errorf("write commit result indeterminate after connection loss (not retried to avoid double-apply): %w", err))
+		}
 		// Serialization failures (1213/1205) guarantee a server-side rollback,
 		// so the write never landed — safe to replay at any phase.
 		if isSerializationError(err) {
@@ -1065,9 +1070,10 @@ func (s *DoltStore) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 		if errors.As(err, &mysqlErr) {
 			return fmt.Errorf("commit write tx: %w", err)
 		}
-		// Tag commit-phase failures so withRetryTx can tell an ambiguous commit
-		// loss apart from a safe-to-replay pre-commit failure.
-		return fmt.Errorf("commit write tx: %w (%w)", err, errCommitPhase)
+		if isIndeterminateCommitResponse(err) {
+			return fmt.Errorf("commit write tx: %w: %w", err, ErrCommitIndeterminate)
+		}
+		return fmt.Errorf("commit write tx: %w", err)
 	}
 	return nil
 }

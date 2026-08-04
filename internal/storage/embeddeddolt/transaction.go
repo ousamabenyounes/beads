@@ -14,9 +14,12 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// RunInTransaction executes a function within a database transaction.
-// After the SQL transaction commits, dirty tables are selectively staged
-// and a Dolt version commit is created with the given message.
+// RunInTransaction executes a function within a database transaction. Its
+// callback is invoked at most once per call; callers retry explicitly after a
+// callback has started when their operation is safe to repeat. An error
+// wrapping storage.ErrCommitIndeterminate must not be blindly replayed.
+// After the SQL transaction commits, dirty tables are selectively staged and a
+// Dolt version commit is created with the given message.
 func (s *EmbeddedDoltStore) RunInTransaction(ctx context.Context, commitMsg string, fn func(tx storage.Transaction) error) error {
 	return s.runTransaction(ctx, commitMsg, func(tx *embeddedTransaction) error { return fn(tx) })
 }

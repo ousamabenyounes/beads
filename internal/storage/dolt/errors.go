@@ -1,9 +1,13 @@
 package dolt
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +47,10 @@ var (
 	// sql-server); the timeout can be raised via the BEADS_FSCK_TIMEOUT
 	// environment variable.
 	ErrFSCKTimeout = errors.New("pre-push integrity check timed out")
+
+	// ErrCommitIndeterminate is the storage-wide no-replay sentinel. Keep this
+	// alias for server-Dolt callers while embedded Dolt returns the same value.
+	ErrCommitIndeterminate = storage.ErrCommitIndeterminate
 
 	// errCommitPhase marks an error as having occurred during tx.Commit (as
 	// opposed to BeginTx or the transaction body). A connection failure during
@@ -91,6 +99,47 @@ func isDoltAutocommitRollbackError(err error) bool {
 		mysqlErr.Number == 1105 &&
 		(mysqlErr.Message == "Merge conflict detected, @autocommit transaction rolled back" ||
 			strings.HasPrefix(mysqlErr.Message, "Merge conflict detected, @autocommit transaction rolled back."))
+}
+
+// isIndeterminateCommitResponse reports response-loss and network errors from
+// a commit-capable operation. A typed MySQL error proves the server responded,
+// even if its message contains connection-like text.
+func isIndeterminateCommitResponse(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrCommitIndeterminate) {
+		return true
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "response lost") ||
+		(strings.Contains(message, "commit response") && strings.Contains(message, "lost")) {
+		return true
+	}
+	return strings.Contains(message, "connection lost") ||
+		strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "i/o timeout") ||
+		strings.Contains(message, "bad connection") ||
+		strings.Contains(message, "invalid connection") ||
+		strings.Contains(message, "lost connection") ||
+		strings.Contains(message, "gone away")
 }
 
 // wrapDBError wraps a database error with operation context.

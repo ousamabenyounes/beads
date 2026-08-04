@@ -119,6 +119,11 @@ func TestIsRetryableError(t *testing.T) {
 			err:      errors.New("Error 1146: Table 'beads.foo' doesn't exist"),
 			expected: false,
 		},
+		{
+			name:     "typed semantic 1105 with connection-like text is not retryable",
+			err:      &mysql.MySQLError{Number: 1105, Message: "connection lost while validating commit"},
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {

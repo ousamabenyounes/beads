@@ -44,6 +44,12 @@ type CloseOpenChildrenError = issueops.CloseOpenChildrenError
 // escape hatch (bd unclaim --force), reserved for admin/reaper use.
 var ErrNotOwner = errors.New("issue claimed by a different actor")
 
+// ErrCommitIndeterminate marks a write error whose durable outcome may be
+// unknown. Such errors must not be replayed because the write may already have
+// landed; retry layers must check this sentinel before classifying a wrapped
+// cause as transient.
+var ErrCommitIndeterminate = errors.New("write commit result indeterminate")
+
 // ClaimedByFragment and NotClaimableStatusFragment are the exact message
 // fragments a claim refusal puts after the sentinel to carry the conflicting
 // assignee/status: ErrAlreadyClaimed reads "<sentinel> by <assignee>" and
@@ -331,7 +337,11 @@ type Storage interface {
 	SetLocalMetadata(ctx context.Context, key, value string) error
 	GetLocalMetadata(ctx context.Context, key string) (string, error)
 
-	// Transactions
+	// RunInTransaction may retry setup failures before fn is entered. Once fn
+	// starts, it is invoked at most once for this public call: callers retry
+	// explicitly when repeating their work is safe. An error wrapping
+	// ErrCommitIndeterminate means the durable outcome may be unknown and must
+	// not be blindly replayed.
 	RunInTransaction(ctx context.Context, commitMsg string, fn func(tx Transaction) error) error
 
 	// MergeSlot — serialized conflict resolution primitive.

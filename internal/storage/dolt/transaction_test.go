@@ -3,6 +3,7 @@ package dolt
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -13,6 +14,32 @@ import (
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// TestRunInTransactionCallbackConnectionErrorIsNotReplayed establishes the
+// public at-most-once callback contract. The callback's error looks transient,
+// but the caller may have performed external work before returning it.
+func TestRunInTransactionCallbackConnectionErrorIsNotReplayed(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	calls := 0
+	err := store.RunInTransaction(ctx, "test: callback at most once", func(storage.Transaction) error {
+		calls++
+		if calls == 1 {
+			return errors.New("invalid connection")
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("callback connection error returned nil")
+	}
+	if calls != 1 {
+		t.Fatalf("callback calls = %d, want 1", calls)
+	}
+}
 
 func TestRunInTransactionIgnoredWritesStayOnActiveBranch(t *testing.T) {
 	store, cleanup := setupTestStore(t)

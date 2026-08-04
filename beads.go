@@ -30,7 +30,10 @@ import (
 	"github.com/steveyegge/beads/internal/workspacegate"
 )
 
-// Storage is the interface for beads storage operations
+// Storage is the interface for beads storage operations. Its
+// RunInTransaction callback is invoked at most once per public call; callers
+// retry it explicitly after a callback has started when their operation is
+// safe to repeat.
 type Storage = beads.Storage
 
 func configuredBackendUnavailable(backend string) error {
@@ -193,7 +196,8 @@ func AsDependentQuerier(s Storage) (DependentQuerier, bool) {
 // and ErrNotClaimable — the ones ParseClaimConflict recovers assignee/status
 // detail from — are re-exported with the other error sentinels below.
 var (
-	ErrCircuitOpen = dolt.ErrCircuitOpen
+	ErrCircuitOpen         = dolt.ErrCircuitOpen
+	ErrCommitIndeterminate = storage.ErrCommitIndeterminate
 )
 
 // IssueClaimer is the atomic-claim surface of a Storage. ClaimIssue and
