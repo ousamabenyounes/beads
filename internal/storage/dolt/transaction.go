@@ -77,7 +77,7 @@ func (s *DoltStore) runInTransaction(
 	fn func(storage.Transaction) error,
 	run func(context.Context, string, func(storage.Transaction) error) error,
 ) error {
-	return s.withRetry(ctx, func() error {
+	return s.withTransactionSetupRetry(ctx, func() error {
 		invoked := false
 		var callbackErr error
 		err := run(ctx, commitMsg, func(tx storage.Transaction) error {
@@ -115,7 +115,7 @@ func (s *DoltStore) runInIssueLifecycleTransaction(
 	fn func(tx storage.IssueLifecycleTransaction) error,
 	run func(context.Context, func(*sql.Tx) error) error,
 ) error {
-	return s.withRetry(ctx, func() error {
+	return s.withTransactionSetupRetry(ctx, func() error {
 		invoked := false
 		var callbackErr error
 		err := run(ctx, func(sqlTx *sql.Tx) error {

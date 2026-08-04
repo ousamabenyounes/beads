@@ -739,6 +739,19 @@ func lockProcessHint() string {
 // If a circuit breaker is configured, it checks the breaker before each attempt
 // and records connection failures/successes to coordinate fail-fast across processes.
 func (s *DoltStore) withRetry(ctx context.Context, op func() error) error {
+	return s.withRetryClassified(ctx, op, isRetryableError)
+}
+
+// withTransactionSetupRetry extends the general connection retry policy with
+// rollback-guaranteed transaction errors. Public transaction wrappers use it
+// only before their callback begins; callback-entered errors are permanent.
+func (s *DoltStore) withTransactionSetupRetry(ctx context.Context, op func() error) error {
+	return s.withRetryClassified(ctx, op, func(err error) bool {
+		return isRetryableError(err) || isDoltAutocommitRollbackError(err) || isSerializationError(err)
+	})
+}
+
+func (s *DoltStore) withRetryClassified(ctx context.Context, op func() error, retryable func(error) bool) error {
 	// Circuit breaker: fail-fast if the server is known to be down.
 	if s.breaker != nil && !s.breaker.Allow() {
 		doltMetrics.circuitRejected.Add(ctx, 1)
@@ -764,7 +777,7 @@ func (s *DoltStore) withRetry(ctx context.Context, op func() error) error {
 			}
 			return backoff.Permanent(err)
 		}
-		if err != nil && isRetryableError(err) {
+		if err != nil && retryable(err) {
 			// Record connection-level failures to the circuit breaker
 			if s.breaker != nil && isConnectionError(err) {
 				s.breaker.RecordFailure()

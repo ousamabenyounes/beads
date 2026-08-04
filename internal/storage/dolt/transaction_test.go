@@ -77,6 +77,84 @@ func TestRunInIssueLifecycleTransactionRollbackDoesNotReplayCallback(t *testing.
 	}
 }
 
+func TestPublicTransactionSetupRetriesRollbackSafeErrorsBeforeCallback(t *testing.T) {
+	rollback1105 := &mysql.MySQLError{
+		Number:  1105,
+		Message: "Merge conflict detected, @autocommit transaction rolled back",
+	}
+	tests := []struct {
+		name string
+		err  error
+		run  func(*DoltStore, error, *int, *int) error
+	}{
+		{
+			name: "transaction exact Dolt rollback",
+			err:  rollback1105,
+			run: func(store *DoltStore, setupErr error, attempts, callbacks *int) error {
+				return store.runInTransaction(context.Background(), "test: setup retry", func(storage.Transaction) error {
+					*callbacks++
+					return nil
+				}, func(_ context.Context, _ string, fn func(storage.Transaction) error) error {
+					*attempts++
+					if *attempts == 1 {
+						return setupErr
+					}
+					return fn(nil)
+				})
+			},
+		},
+		{
+			name: "transaction deadlock",
+			err:  &mysql.MySQLError{Number: 1213, Message: "deadlock"},
+			run: func(store *DoltStore, setupErr error, attempts, callbacks *int) error {
+				return store.runInTransaction(context.Background(), "test: setup retry", func(storage.Transaction) error {
+					*callbacks++
+					return nil
+				}, func(_ context.Context, _ string, fn func(storage.Transaction) error) error {
+					*attempts++
+					if *attempts == 1 {
+						return setupErr
+					}
+					return fn(nil)
+				})
+			},
+		},
+		{
+			name: "lifecycle lock timeout",
+			err:  &mysql.MySQLError{Number: 1205, Message: "lock wait timeout"},
+			run: func(store *DoltStore, setupErr error, attempts, callbacks *int) error {
+				return store.runInIssueLifecycleTransaction(context.Background(), "test: setup retry", func(storage.IssueLifecycleTransaction) error {
+					*callbacks++
+					return nil
+				}, func(_ context.Context, fn func(*sql.Tx) error) error {
+					*attempts++
+					if *attempts == 1 {
+						return setupErr
+					}
+					return fn(nil)
+				})
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &DoltStore{}
+			attempts := 0
+			callbacks := 0
+			if err := tt.run(store, tt.err, &attempts, &callbacks); err != nil {
+				t.Fatalf("transaction wrapper error = %v, want nil", err)
+			}
+			if attempts != 2 {
+				t.Fatalf("setup attempts = %d, want 2", attempts)
+			}
+			if callbacks != 1 {
+				t.Fatalf("callback calls = %d, want 1", callbacks)
+			}
+		})
+	}
+}
+
 // TestRunInTransactionSerializationConflictInvokesCallbacksOnce orders two
 // independent handles so the stale transaction loses at commit. The public
 // callbacks must still each run once, and the winner's content must survive.
