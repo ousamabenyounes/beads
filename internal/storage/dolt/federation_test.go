@@ -486,11 +486,12 @@ func TestFederationPushPullMethods(t *testing.T) {
 // 3. Non-excluded issues remain intact
 // 4. The original branch is unchanged after the operation
 func TestFilteredPushExcludesWisp(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := testContext(t)
 	defer cancel()
+	versionWispTablesForFilteredPush(t, ctx, store)
 
 	// Create a regular task (should survive filtering)
 	task := &types.Issue{
@@ -1048,7 +1049,7 @@ func listFederationStagingBranches(t *testing.T, ctx context.Context, db *sql.DB
 // TestFilteredPushOptOut verifies that setting federation.exclude_types to
 // an empty list disables filtering (backward-compatible opt-out).
 func TestFilteredPushOptOut(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := testContext(t)
@@ -1252,11 +1253,12 @@ func TestFilteredStagingPublishesRetainedWaiterUnblocked(t *testing.T) {
 // TestFilteredPushStagingBranchCleanupOnError verifies that the staging
 // branch is always cleaned up, even when the push operation fails.
 func TestFilteredPushStagingBranchCleanupOnError(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := testContext(t)
 	defer cancel()
+	versionWispTablesForFilteredPush(t, ctx, store)
 
 	// Run filtered push to a nonexistent peer — will fail, but staging
 	// branch should still be cleaned up.
