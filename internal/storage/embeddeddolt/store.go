@@ -249,12 +249,21 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 		return
 	}
 
-	if cErr := tx.Commit(); cErr != nil {
-		err = fmt.Errorf("embeddeddolt: commit tx: %w", cErr)
+	if cErr := commitEmbeddedTx(tx); cErr != nil {
+		err = cErr
 		return
 	}
 	committed = true
 	return
+}
+
+// commitEmbeddedTx classifies an unconfirmed SQL commit response as
+// indeterminate: the engine may have applied it before the connection failed.
+func commitEmbeddedTx(tx *sql.Tx) error {
+	if err := tx.Commit(); err != nil {
+		return wrapCommitIndeterminate("embeddeddolt: commit tx", err)
+	}
+	return nil
 }
 
 func joinTransactionCleanupError(operationErr, cleanupErr error, committed bool) error {
