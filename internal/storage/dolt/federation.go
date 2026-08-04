@@ -437,10 +437,17 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 		return s.PushTo(ctx, peer)
 	}
 
-	// Pin a single connection for session-scoped branch operations.
-	conn, err := s.db.Conn(ctx)
+	// Pin a single long-timeout connection for the complete session-scoped
+	// staging lifecycle. RecomputeAllIsBlockedInTx can exceed the shared
+	// pool's 10-second I/O deadline, and branch state is connection-scoped.
+	db, err := s.openLongTimeoutConn()
 	if err != nil {
-		return fmt.Errorf("federation filter: acquire connection: %w", err)
+		return fmt.Errorf("federation filter: open long-timeout connection: %w", err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("federation filter: acquire long-timeout connection: %w", err)
 	}
 	defer conn.Close()
 

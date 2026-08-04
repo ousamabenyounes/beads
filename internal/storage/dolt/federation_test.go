@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -560,6 +561,50 @@ func TestFilteredPushExcludesWisp(t *testing.T) {
 	}
 	if wispCount != 1 {
 		t.Errorf("ephemeral issue should still exist on original branch, got count=%d", wispCount)
+	}
+}
+
+// TestFilteredPushUsesDedicatedLongTimeoutConnection proves the full staging
+// lifecycle does not borrow the shared pool. RecomputeAllIsBlockedInTx can
+// exceed the pool's 10-second I/O deadline, so branch creation, checkout,
+// deletion, recompute, DOLT_COMMIT, and restoration must all run through one
+// pinned connection from the dedicated long-timeout DB before the push begins.
+func TestFilteredPushUsesDedicatedLongTimeoutConnection(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Ensure filtering takes the delete/recompute/DOLT_COMMIT path rather than
+	// skipping it because there was nothing to exclude.
+	if err := store.CreateIssue(ctx, &types.Issue{
+		ID:        "fed-long-timeout-wisp",
+		Title:     "Wisp for long-timeout staging",
+		IssueType: types.TypeTask,
+		Status:    types.StatusOpen,
+		Priority:  1,
+	}, "test"); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "UPDATE issues SET ephemeral = 1 WHERE id = ?", "fed-long-timeout-wisp"); err != nil {
+		t.Fatalf("mark issue ephemeral: %v", err)
+	}
+	if err := store.Commit(ctx, "seed long-timeout filtered staging"); err != nil && !isDoltNothingToCommit(err) {
+		t.Fatalf("commit filtered staging seed: %v", err)
+	}
+
+	// The previous implementation acquired conn from this pool, so closing it
+	// made the first staging step fail. The staging lifecycle must instead use
+	// openLongTimeoutConn and reach the post-staging peer-credential lookup only
+	// after it has restored the source branch.
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("close shared pool: %v", err)
+	}
+	if err := store.filteredPushToPeer(ctx, "nonexistent-peer", []string{"wisp"}); err == nil {
+		t.Fatal("expected peer credential error with shared pool closed")
+	} else if !strings.Contains(err.Error(), "failed to get peer credentials") {
+		t.Fatalf("staging lifecycle did not complete on dedicated long-timeout connection before peer lookup: %v", err)
 	}
 }
 
