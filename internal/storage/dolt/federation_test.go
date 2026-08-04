@@ -3,16 +3,21 @@
 package dolt
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
@@ -671,6 +676,93 @@ func TestFilteredPushConcurrentOperationsUseDistinctStagingBranches(t *testing.T
 	}
 }
 
+// TestFilteredPushCleanupSurvivesLostBranchCreateResponse proves cleanup is
+// armed before branch creation becomes externally visible. The test dialer
+// forwards the real DOLT_BRANCH call, withholds its response until another
+// connection observes the branch, then drops that response after cancellation.
+func TestFilteredPushCleanupSurvivesLostBranchCreateResponse(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	observer, err := store.openLongTimeoutConn()
+	if err != nil {
+		t.Fatalf("open staging observer: %v", err)
+	}
+	defer observer.Close()
+
+	loss := installFederationBranchResponseLossDialer(t, store)
+	defer loss.drop()
+	pushCtx, cancelPush := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- store.filteredPushToPeer(pushCtx, "nonexistent-peer", []string{"wisp"})
+	}()
+
+	select {
+	case <-loss.responseBlocked:
+	case err := <-errCh:
+		t.Fatalf("filtered push returned before branch response was blocked: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("filtered push did not issue staging branch creation")
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	var stagingBranches []string
+	for time.Now().Before(deadline) {
+		stagingBranches = listFederationStagingBranches(t, ctx, observer)
+		if len(stagingBranches) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(stagingBranches) != 1 {
+		t.Fatalf("server-side staging branches = %v, want one before response loss", stagingBranches)
+	}
+
+	cancelPush()
+	loss.drop()
+	select {
+	case err = <-errCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("filtered push did not return after dropping branch response")
+	}
+	if err == nil || !strings.Contains(err.Error(), "federation filter: create staging branch") {
+		t.Fatalf("filtered push error = %v, want original branch-create failure", err)
+	}
+	if strings.Contains(err.Error(), "federation filter: cleanup") {
+		t.Fatalf("cleanup masked branch-create failure: %v", err)
+	}
+	assertFederationStagingBranchAbsent(t, ctx, observer)
+}
+
+func TestDeleteFederationStagingBranchIgnoresOnlyMissingBranch(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	conn, err := store.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire cleanup test connection: %v", err)
+	}
+	defer conn.Close()
+
+	t.Run("missing branch", func(t *testing.T) {
+		err := deleteFederationStagingBranch(ctx, conn, federationStagingBranchPrefix+"missing")
+		if err != nil {
+			t.Fatalf("delete missing staging branch: %v", err)
+		}
+	})
+
+	t.Run("real delete error", func(t *testing.T) {
+		err := deleteFederationStagingBranch(ctx, conn, "")
+		if err == nil {
+			t.Fatal("delete empty staging branch succeeded, want error")
+		}
+	})
+}
+
 // TestFilteredPushCleanupSurvivesCallerCancellation cancels the caller while
 // the staging DELETE is executing. go-sql-driver/mysql invalidates that
 // operation connection on cancellation, so cleanup must discard it, reopen a
@@ -1044,6 +1136,70 @@ func listFederationStagingBranches(t *testing.T, ctx context.Context, db *sql.DB
 		t.Fatalf("iterate federation staging branches: %v", err)
 	}
 	return branches
+}
+
+type federationBranchResponseLossDialer struct {
+	armed           atomic.Bool
+	responseBlocked chan struct{}
+	dropResponse    chan struct{}
+	blockedOnce     sync.Once
+	dropOnce        sync.Once
+}
+
+func installFederationBranchResponseLossDialer(t *testing.T, store *DoltStore) *federationBranchResponseLossDialer {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(store.connStr)
+	if err != nil {
+		t.Fatalf("parse store DSN: %v", err)
+	}
+	if cfg.Net != "tcp" {
+		t.Fatalf("response-loss dialer requires TCP, got %q", cfg.Net)
+	}
+	dialer := &federationBranchResponseLossDialer{
+		responseBlocked: make(chan struct{}),
+		dropResponse:    make(chan struct{}),
+	}
+	network := fmt.Sprintf("federation_response_loss_%d", time.Now().UnixNano())
+	mysql.RegisterDialContext(network, func(ctx context.Context, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return &federationBranchResponseLossConn{Conn: conn, dialer: dialer}, nil
+	})
+	t.Cleanup(func() { mysql.DeregisterDialContext(network) })
+	cfg.Net = network
+	store.connStr = cfg.FormatDSN()
+	return dialer
+}
+
+func (d *federationBranchResponseLossDialer) drop() {
+	d.dropOnce.Do(func() { close(d.dropResponse) })
+}
+
+type federationBranchResponseLossConn struct {
+	net.Conn
+	dialer        *federationBranchResponseLossDialer
+	blockResponse atomic.Bool
+}
+
+func (c *federationBranchResponseLossConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err == nil && bytes.Contains(bytes.ToLower(p), []byte("call dolt_branch(")) &&
+		bytes.Contains(p, []byte(federationStagingBranchPrefix)) && c.dialer.armed.CompareAndSwap(false, true) {
+		c.blockResponse.Store(true)
+	}
+	return n, err
+}
+
+func (c *federationBranchResponseLossConn) Read(p []byte) (int, error) {
+	if !c.blockResponse.Load() {
+		return c.Conn.Read(p)
+	}
+	c.dialer.blockedOnce.Do(func() { close(c.dialer.responseBlocked) })
+	<-c.dialer.dropResponse
+	_ = c.Conn.Close()
+	return 0, net.ErrClosed
 }
 
 // TestFilteredPushOptOut verifies that setting federation.exclude_types to

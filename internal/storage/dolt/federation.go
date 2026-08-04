@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
@@ -463,11 +464,6 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	}
 	defer conn.Close()
 
-	// Create staging branch from the current branch.
-	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?, ?)", stagingBranch, sourceBranch); err != nil {
-		return fmt.Errorf("federation filter: create staging branch: %w", err)
-	}
-
 	// Ensure cleanup on a fresh connection: canceling an in-flight query makes
 	// go-sql-driver/mysql invalidate the operation connection.
 	defer func() {
@@ -485,7 +481,7 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 			if err := schema.DrainCall(cleanupCtx, cleanupConn, "CALL DOLT_CHECKOUT(?)", sourceBranch); err != nil {
 				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("restore branch %s: %w", sourceBranch, err))
 			}
-			if err := schema.DrainCall(cleanupCtx, cleanupConn, "CALL DOLT_BRANCH('-Df', ?)", stagingBranch); err != nil {
+			if err := deleteFederationStagingBranch(cleanupCtx, cleanupConn, stagingBranch); err != nil {
 				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete staging branch: %w", err))
 			}
 		}
@@ -493,6 +489,12 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 			retErr = errors.Join(retErr, fmt.Errorf("federation filter: cleanup: %w", cleanupErr))
 		}
 	}()
+
+	// Create staging branch from the current branch. Cleanup is already armed:
+	// a lost response can make this call fail after Dolt created the branch.
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?, ?)", stagingBranch, sourceBranch); err != nil {
+		return fmt.Errorf("federation filter: create staging branch: %w", err)
+	}
 
 	// Checkout staging branch.
 	if err := versioncontrolops.CheckoutBranch(ctx, conn, stagingBranch); err != nil {
@@ -530,6 +532,15 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	// Push staging branch to peer, mapped to the peer's expected branch name.
 	refspec := stagingBranch + ":" + sourceBranch
 	return s.pushRefToPeer(ctx, peer, refspec)
+}
+
+func deleteFederationStagingBranch(ctx context.Context, conn *sql.Conn, stagingBranch string) error {
+	err := schema.DrainCall(ctx, conn, "CALL DOLT_BRANCH('-Df', ?)", stagingBranch)
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1105 && mysqlErr.Message == "branch not found" {
+		return nil
+	}
+	return err
 }
 
 // commitFilteredStaging repairs and commits the filtered graph on the staging
