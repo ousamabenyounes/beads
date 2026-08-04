@@ -132,6 +132,15 @@ func commitAllInTx(ctx context.Context, tx *sql.Tx, message string, tolerateEmpt
 	return true, nil
 }
 
+// stageAndCommitAfterSQLCommit preserves the no-replay boundary for version
+// publication after an already-visible SQL mutation.
+func stageAndCommitAfterSQLCommit(ctx context.Context, db versioncontrolops.DBConn, dirtyTables map[string]bool, commitMsg, author string) error {
+	if err := versioncontrolops.StageAndCommit(ctx, db, dirtyTables, commitMsg, author); err != nil {
+		return wrapCommitIndeterminate("embeddeddolt: stage and commit after SQL commit", err)
+	}
+	return nil
+}
+
 // Commit stages and commits the full working set. A clean working set is not
 // an error here: the server store (DoltStore.Commit et al., via
 // isDoltNothingToCommit) has always tolerated Dolt's "nothing to commit"
@@ -363,7 +372,7 @@ func (s *EmbeddedDoltStore) RecomputeAllBlocked(ctx context.Context) (int, error
 		// Stage only issues (wisps are dolt_ignore'd), matching the post-pull
 		// recompute, so an unrelated dirty working set is not swept in.
 		if err := s.withMutatingDBConn(ctx, func(db versioncontrolops.DBConn) error {
-			return versioncontrolops.StageAndCommit(ctx, db,
+			return stageAndCommitAfterSQLCommit(ctx, db,
 				map[string]bool{"issues": true}, "bd: recompute is_blocked (full)", commitAuthor)
 		}); err != nil {
 			return int(changed), err
@@ -631,7 +640,7 @@ func (s *EmbeddedDoltStore) recomputeBlockedAfterPull(ctx context.Context, preHe
 		return err
 	}
 	return s.withMutatingDBConn(ctx, func(db versioncontrolops.DBConn) error {
-		return versioncontrolops.StageAndCommit(ctx, db,
+		return stageAndCommitAfterSQLCommit(ctx, db,
 			map[string]bool{"issues": true}, "bd: recompute is_blocked after pull", commitAuthor)
 	})
 }
