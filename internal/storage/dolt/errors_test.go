@@ -36,6 +36,12 @@ func TestIsIndeterminateCommitResponse(t *testing.T) {
 	}
 }
 
+func TestWrapSQLCommitError(t *testing.T) {
+	if err := wrapSQLCommitError("commit wisp", nil); err != nil {
+		t.Fatalf("wrapSQLCommitError(nil) = %v, want nil", err)
+	}
+}
+
 func TestWrapDBError(t *testing.T) {
 	t.Run("nil error returns nil", func(t *testing.T) {
 		if err := wrapDBError("op", nil); err != nil {

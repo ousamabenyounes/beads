@@ -105,6 +105,9 @@ func isIndeterminateCommitResponse(err error) bool {
 }
 
 func wrapSQLCommitError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
 	if isIndeterminateCommitResponse(err) {
 		return fmt.Errorf("%s: %w: %w", op, err, ErrCommitIndeterminate)
 	}

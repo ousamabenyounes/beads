@@ -751,9 +751,34 @@ func (s *DoltStore) withTransactionSetupRetry(ctx context.Context, op func() err
 	})
 }
 
+type circuitWriteContextKey struct{}
+
+func circuitWriteManaged(ctx context.Context) bool {
+	_, ok := ctx.Value(circuitWriteContextKey{}).(struct{})
+	return ok
+}
+
+// withCircuitWrite admits one externally visible write and records its
+// terminal success. Nested retry helpers keep failure accounting but defer
+// their success reset to this boundary.
+func (s *DoltStore) withCircuitWrite(ctx context.Context, op func(context.Context) error) error {
+	if circuitWriteManaged(ctx) {
+		return op(ctx)
+	}
+	if s.breaker != nil && !s.breaker.Allow() {
+		doltMetrics.circuitRejected.Add(ctx, 1)
+		return ErrCircuitOpen
+	}
+	err := op(context.WithValue(ctx, circuitWriteContextKey{}, struct{}{}))
+	if err == nil && s.breaker != nil {
+		s.breaker.RecordSuccess()
+	}
+	return err
+}
+
 func (s *DoltStore) withRetryClassified(ctx context.Context, op func() error, retryable func(error) bool) error {
 	// Circuit breaker: fail-fast if the server is known to be down.
-	if s.breaker != nil && !s.breaker.Allow() {
+	if !circuitWriteManaged(ctx) && s.breaker != nil && !s.breaker.Allow() {
 		doltMetrics.circuitRejected.Add(ctx, 1)
 		return ErrCircuitOpen
 	}
@@ -793,7 +818,7 @@ func (s *DoltStore) withRetryClassified(ctx context.Context, op func() error, re
 			return backoff.Permanent(err) // Non-retryable - stop immediately
 		}
 		// Success — reset the circuit breaker
-		if s.breaker != nil {
+		if !circuitWriteManaged(ctx) && s.breaker != nil {
 			s.breaker.RecordSuccess()
 		}
 		return nil
@@ -1035,7 +1060,7 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	// Keep circuit admission at the transaction retry boundary. Calling
 	// withRetry from here would multiply retries and could replay a write after
 	// an indeterminate commit.
-	if s.breaker != nil && !s.breaker.Allow() {
+	if !circuitWriteManaged(ctx) && s.breaker != nil && !s.breaker.Allow() {
 		doltMetrics.circuitRejected.Add(ctx, 1)
 		return ErrCircuitOpen
 	}
@@ -1049,7 +1074,7 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	return backoff.Retry(func() error {
 		err := s.withWriteTx(ctx, fn)
 		if err == nil {
-			if s.breaker != nil {
+			if !circuitWriteManaged(ctx) && s.breaker != nil {
 				s.breaker.RecordSuccess()
 			}
 			return nil
@@ -2800,7 +2825,9 @@ const (
 // Callers that intentionally modify config (e.g., CommitPending after
 // 'bd config set') must call CommitWithConfig instead.
 func (s *DoltStore) Commit(ctx context.Context, message string) error {
-	return s.commitWorkingSet(ctx, message, configExclude)
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.commitWorkingSet(ctx, message, configExclude)
+	})
 }
 
 // commitBeforePull commits the working set ahead of a pull's merge, INCLUDING
@@ -2841,7 +2868,9 @@ func (s *DoltStore) commitBeforePull(ctx context.Context, message string) error 
 // concludes bd vc merge --strategy through the same config-inclusive commit
 // instead of the config-excluding Commit that would drop the resolution.
 func (s *DoltStore) CommitMergeResolution(ctx context.Context, message string) error {
-	return s.commitWorkingSet(ctx, message, configIncludeAll)
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.commitWorkingSet(ctx, message, configIncludeAll)
+	})
 }
 
 // commitWorkingSet stages the dirty tables reported by dolt_status and commits
@@ -3021,19 +3050,21 @@ func (s *DoltStore) assertDirtyConfigUserKVOnly(ctx context.Context, conn *sql.C
 // (e.g., CommitPending after 'bd config set', 'bd init', or 'bd rename-prefix').
 // GH#2455: Commit() excludes config to prevent sweeping up stale changes.
 func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error {
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to acquire connection: %w", err)
-	}
-	defer conn.Close()
-
-	if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
-		if isDoltNothingToCommit(err) {
-			return nil
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		conn, err := s.db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to acquire connection: %w", err)
 		}
-		return s.wrapDoltPublicationFailure(ctx, "failed to commit", err)
-	}
-	return nil
+		defer conn.Close()
+
+		if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
+			if isDoltNothingToCommit(err) {
+				return nil
+			}
+			return s.wrapDoltPublicationFailure(ctx, "failed to commit", err)
+		}
+		return nil
+	})
 }
 
 // doltAddAndCommit stages the specified tables and commits on a pinned
@@ -3042,25 +3073,27 @@ func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error 
 // already committed its SQL mutation, so any publication failure here has an
 // indeterminate durable outcome and must not be replayed.
 func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commitMsg string) error {
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return s.recordDoltPublicationFailure(ctx,
-			fmt.Errorf("acquire connection after SQL mutation: %w: %w", err, ErrCommitIndeterminate))
-	}
-	defer conn.Close()
-
-	for _, table := range tables {
-		if err := schema.DrainCall(ctx, conn, "CALL DOLT_ADD(?)", table); err != nil {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		conn, err := s.db.Conn(ctx)
+		if err != nil {
 			return s.recordDoltPublicationFailure(ctx,
-				fmt.Errorf("dolt add %s after SQL mutation: %w: %w", table, err, ErrCommitIndeterminate))
+				fmt.Errorf("acquire connection after SQL mutation: %w: %w", err, ErrCommitIndeterminate))
 		}
-	}
-	if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-		return s.recordDoltPublicationFailure(ctx,
-			fmt.Errorf("dolt commit after SQL mutation: %w: %w", err, ErrCommitIndeterminate))
-	}
-	return nil
+		defer conn.Close()
+
+		for _, table := range tables {
+			if err := schema.DrainCall(ctx, conn, "CALL DOLT_ADD(?)", table); err != nil {
+				return s.recordDoltPublicationFailure(ctx,
+					fmt.Errorf("dolt add %s after SQL mutation: %w: %w", table, err, ErrCommitIndeterminate))
+			}
+		}
+		if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
+			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+			return s.recordDoltPublicationFailure(ctx,
+				fmt.Errorf("dolt commit after SQL mutation: %w: %w", err, ErrCommitIndeterminate))
+		}
+		return nil
+	})
 }
 
 func (s *DoltStore) wrapDoltPublicationFailure(ctx context.Context, op string, err error) error {
@@ -3826,6 +3859,12 @@ func (s *DoltStore) openLongTimeoutConn() (*sql.DB, error) {
 // fallback targets it directly, so pulls from non-default remotes (PullRemote,
 // federation peers) no longer fall back to s.remote.
 func (s *DoltStore) pullWithAutoResolve(ctx context.Context, remote string, query string, args ...any) error {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.pullWithAutoResolveUnchecked(ctx, remote, query, args...)
+	})
+}
+
+func (s *DoltStore) pullWithAutoResolveUnchecked(ctx context.Context, remote string, query string, args ...any) error {
 	db, err := s.openLongTimeoutConn()
 	if err != nil {
 		return err
@@ -3956,6 +3995,12 @@ func (s *DoltStore) settleMergeInTx(ctx context.Context, tx *sql.Tx, pullErr err
 // could not be read, which degrades to a full recompute. A pull that merged
 // nothing (HEAD unchanged) is a no-op.
 func (s *DoltStore) recomputeBlockedAfterPull(ctx context.Context, fromCommit string) error {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.recomputeBlockedAfterPullUnchecked(ctx, fromCommit)
+	})
+}
+
+func (s *DoltStore) recomputeBlockedAfterPullUnchecked(ctx context.Context, fromCommit string) error {
 	if err := s.recomputeBlockedTx(ctx, fromCommit); err != nil {
 		// The merge this recompute covers is already committed, so a plain
 		// retry on the next pull would skip as "nothing merged" — leave a
@@ -3981,6 +4026,16 @@ func (s *DoltStore) recomputeBlockedAfterPull(ctx context.Context, fromCommit st
 // operator resolved by hand — leaves is_blocked stale until this full pass runs.
 // Idempotent: a consistent database corrects nothing.
 func (s *DoltStore) RecomputeAllBlocked(ctx context.Context) (int, error) {
+	var changed int
+	err := s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		var err error
+		changed, err = s.recomputeAllBlocked(ctx)
+		return err
+	})
+	return changed, err
+}
+
+func (s *DoltStore) recomputeAllBlocked(ctx context.Context) (int, error) {
 	// The full pass's batched UPDATEs carry five correlated EXISTS subqueries
 	// each; on a loaded shared server a single batch can outlive the pool's
 	// per-I/O deadline (default 10s, see buildServerDSN), killing the repair

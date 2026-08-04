@@ -21,6 +21,12 @@ import (
 // CreateIssue creates a new issue.
 // Delegates SQL work to issueops; handles Dolt versioning for non-ephemeral issues.
 func (s *DoltStore) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.createIssue(ctx, issue, actor)
+	})
+}
+
+func (s *DoltStore) createIssue(ctx context.Context, issue *types.Issue, actor string) error {
 	if issue == nil {
 		return fmt.Errorf("issue must not be nil")
 	}
@@ -88,6 +94,12 @@ func (s *DoltStore) CreateIssues(ctx context.Context, issues []*types.Issue, act
 // CreateIssuesWithFullOptions creates multiple issues with full options control.
 // Delegates SQL work to issueops; handles Dolt versioning for non-ephemeral batches.
 func (s *DoltStore) CreateIssuesWithFullOptions(ctx context.Context, issues []*types.Issue, actor string, opts storage.BatchCreateOptions) error {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.createIssuesWithFullOptions(ctx, issues, actor, opts)
+	})
+}
+
+func (s *DoltStore) createIssuesWithFullOptions(ctx context.Context, issues []*types.Issue, actor string, opts storage.BatchCreateOptions) error {
 	if len(issues) == 0 {
 		return nil
 	}
