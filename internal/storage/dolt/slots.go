@@ -58,7 +58,10 @@ func (s *DoltStore) mergeMetadataWisp(ctx context.Context, issueID, key string, 
 	if err := issueops.MergeMetadataInTx(ctx, tx, issueID, key, value, actor); err != nil {
 		return err
 	}
-	return wrapTransactionError("commit merge metadata wisp", tx.Commit())
+	if err := tx.Commit(); err != nil {
+		return wrapSQLCommitError("commit merge metadata wisp", err)
+	}
+	return nil
 }
 
 // SlotSet sets a key-value pair in the issue's metadata JSON.
@@ -151,5 +154,8 @@ func (s *DoltStore) clearMetadataWisp(ctx context.Context, issueID, key, actor s
 	if err := issueops.DeleteMetadataInTx(ctx, tx, issueID, key, actor); err != nil {
 		return err
 	}
-	return wrapTransactionError("commit clear metadata wisp", tx.Commit())
+	if err := tx.Commit(); err != nil {
+		return wrapSQLCommitError("commit clear metadata wisp", err)
+	}
+	return nil
 }

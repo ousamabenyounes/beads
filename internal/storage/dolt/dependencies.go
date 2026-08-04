@@ -98,7 +98,10 @@ func (s *DoltStore) RemoveDependencyWithOptions(ctx context.Context, issueID, de
 		if _, err := issueops.RemoveDependencyInTx(ctx, tx, issueID, dependsOnID, actor, rmOpts.EmitEvent); err != nil {
 			return err
 		}
-		return wrapTransactionError("commit remove wisp dependency", tx.Commit())
+		if err := tx.Commit(); err != nil {
+			return wrapSQLCommitError("commit remove wisp dependency", err)
+		}
+		return nil
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -113,7 +116,7 @@ func (s *DoltStore) RemoveDependencyWithOptions(ctx context.Context, issueID, de
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sql commit: %w", err)
+		return wrapSQLCommitError("sql commit", err)
 	}
 	// GH#2455: Use explicit DOLT_ADD to avoid sweeping up stale config changes.
 	// Stage events only when RemoveDependencyInTx actually recorded a

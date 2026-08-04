@@ -21,7 +21,9 @@ type slotCommitBoundaryDriver struct {
 	metadata        string
 	stageErr        error
 	commitErr       error
+	sqlCommitErr    error
 	nothingToCommit bool
+	activeWisp      bool
 
 	metadataUpdates int
 	eventInserts    int
@@ -65,20 +67,32 @@ func (c *slotCommitBoundaryConn) QueryContext(_ context.Context, query string, _
 
 	switch {
 	case strings.Contains(query, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1"):
+		if c.driver.activeWisp {
+			return &claimCommitBoundaryRows{columns: []string{"exists"}, values: [][]driver.Value{{int64(1)}}}, nil
+		}
 		return &claimCommitBoundaryRows{columns: []string{"exists"}}, nil
-	case strings.Contains(query, "SELECT metadata FROM issues WHERE id = ?"):
+	case strings.Contains(query, "SELECT metadata FROM issues WHERE id = ?"),
+		strings.Contains(query, "SELECT metadata FROM wisps WHERE id = ?"):
 		return &claimCommitBoundaryRows{
 			columns: []string{"metadata"},
 			values:  [][]driver.Value{{c.driver.metadata}},
 		}, nil
 	case strings.Contains(query, "FROM issues") && strings.Contains(query, "LEFT JOIN leases") && strings.Contains(query, "WHERE id = ?"):
+		if c.driver.activeWisp {
+			return &claimCommitBoundaryRows{columns: claimBoundaryIssueColumns()}, nil
+		}
 		return &claimCommitBoundaryRows{
 			columns: claimBoundaryIssueColumns(),
 			values:  [][]driver.Value{slotBoundaryIssueValues("slot-boundary", c.driver.metadata)},
 		}, nil
-	case strings.Contains(query, "SELECT label FROM labels"):
+	case strings.Contains(query, "FROM wisps") && strings.Contains(query, "LEFT JOIN leases") && strings.Contains(query, "WHERE id = ?"):
+		return &claimCommitBoundaryRows{
+			columns: claimBoundaryIssueColumns(),
+			values:  [][]driver.Value{slotBoundaryIssueValues("slot-boundary", c.driver.metadata)},
+		}, nil
+	case strings.Contains(query, "SELECT label FROM labels"), strings.Contains(query, "SELECT label FROM wisp_labels"):
 		return &claimCommitBoundaryRows{columns: []string{"label"}}, nil
-	case strings.Contains(query, "SELECT id FROM events"):
+	case strings.Contains(query, "SELECT id FROM events"), strings.Contains(query, "SELECT id FROM wisp_events"):
 		return &claimCommitBoundaryRows{columns: []string{"id"}}, nil
 	case strings.Contains(query, "CALL DOLT_ADD"):
 		c.driver.stageCalls++
@@ -104,9 +118,9 @@ func (c *slotCommitBoundaryConn) ExecContext(_ context.Context, query string, _ 
 	c.driver.mu.Lock()
 	defer c.driver.mu.Unlock()
 	switch {
-	case strings.Contains(query, "UPDATE issues") && strings.Contains(query, "`metadata`"):
+	case (strings.Contains(query, "UPDATE issues") || strings.Contains(query, "UPDATE wisps")) && strings.Contains(query, "`metadata`"):
 		c.driver.metadataUpdates++
-	case strings.Contains(query, "INSERT INTO events"):
+	case strings.Contains(query, "INSERT INTO events"), strings.Contains(query, "INSERT INTO wisp_events"):
 		c.driver.eventInserts++
 	}
 	return driver.RowsAffected(1), nil
@@ -120,7 +134,7 @@ func (t *slotCommitBoundaryTx) Commit() error {
 	t.driver.mu.Lock()
 	defer t.driver.mu.Unlock()
 	t.driver.txCommits++
-	return nil
+	return t.driver.sqlCommitErr
 }
 
 func (t *slotCommitBoundaryTx) Rollback() error {
@@ -235,6 +249,40 @@ func TestMetadataSlotWritesDoltCommitResponseLossIsIndeterminateAndNotReplayed(t
 			}
 			if driver.txAttempts != 1 || driver.txCommits != 0 || driver.txRollbacks != 1 {
 				t.Fatalf("SQL transaction outcomes = attempts:%d commits:%d rollbacks:%d, want attempts:1 commits:0 rollbacks:1", driver.txAttempts, driver.txCommits, driver.txRollbacks)
+			}
+		})
+	}
+}
+
+func TestWispMetadataSlotWritesSQLCommitResponseLossIsIndeterminateAndNotReplayed(t *testing.T) {
+	for _, tc := range metadataSlotWriteCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			driver := &slotCommitBoundaryDriver{
+				metadata:     tc.metadata,
+				activeWisp:   true,
+				sqlCommitErr: testConnectionLoss,
+			}
+			store := newSlotCommitBoundaryStore(driver)
+			t.Cleanup(func() { _ = store.db.Close() })
+
+			err := tc.run(store)
+			if !errors.Is(err, ErrCommitIndeterminate) {
+				t.Fatalf("wisp metadata slot write error = %v, want ErrCommitIndeterminate", err)
+			}
+			if !errors.Is(err, testConnectionLoss) {
+				t.Fatalf("wisp metadata slot write error = %v, want cause %v", err, testConnectionLoss)
+			}
+
+			driver.mu.Lock()
+			defer driver.mu.Unlock()
+			if driver.metadataUpdates != 1 || driver.eventInserts != 1 {
+				t.Fatalf("mutation attempts = updates:%d events:%d, want updates:1 events:1 (no replay)", driver.metadataUpdates, driver.eventInserts)
+			}
+			if driver.stageCalls != 0 || driver.doltCommits != 0 {
+				t.Fatalf("wisp write unexpectedly used Dolt versioning: adds:%d commits:%d", driver.stageCalls, driver.doltCommits)
+			}
+			if driver.txAttempts != 1 || driver.txCommits != 1 {
+				t.Fatalf("SQL transaction attempts = %d, commit calls = %d, want 1 and 1", driver.txAttempts, driver.txCommits)
 			}
 		})
 	}
