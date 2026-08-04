@@ -1153,10 +1153,11 @@ func TestFilteredStagingPublishesRetainedWaiterUnblocked(t *testing.T) {
 	if os.Getenv("BEADS_TEST_ENV_RUN_DOLT") == "1" && testServerPort == 0 {
 		t.Fatal("BEADS_TEST_ENV_RUN_DOLT=1 but real-Dolt test infrastructure is unavailable")
 	}
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 	ctx, cancel := testContext(t)
 	defer cancel()
+	versionWispTablesForFilteredPush(t, ctx, store)
 
 	waiter := &types.Issue{ID: "fed-filter-w", Title: "retained waiter", IssueType: types.TypeBug, Status: types.StatusOpen, Priority: 1}
 	blocker := &types.Issue{ID: "fed-filter-x", Title: "excluded blocker", IssueType: types.TypeTask, Status: types.StatusOpen, Priority: 1, Labels: []string{"private"}}
