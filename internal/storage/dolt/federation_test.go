@@ -515,8 +515,9 @@ func TestFilteredPushExcludesWisp(t *testing.T) {
 	// Create an ephemeral issue directly in the issues table (simulates the
 	// edge case where an ephemeral issue leaks into committed data).
 	_, err := store.db.ExecContext(ctx, `INSERT INTO issues
-		(id, title, issue_type, status, priority, ephemeral, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+		(id, title, description, design, acceptance_criteria, notes,
+		 issue_type, status, priority, ephemeral, created_at, updated_at)
+		VALUES (?, ?, '', '', '', '', ?, ?, ?, 1, NOW(), NOW())`,
 		"fed-filter-wisp", "Leaked wisp", "task", "open", 1)
 	if err != nil {
 		t.Fatalf("insert ephemeral issue: %v", err)
@@ -1213,8 +1214,9 @@ func TestFilteredPushOptOut(t *testing.T) {
 
 	// Create an ephemeral issue in the committed issues table.
 	_, err := store.db.ExecContext(ctx, `INSERT INTO issues
-		(id, title, issue_type, status, priority, ephemeral, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+		(id, title, description, design, acceptance_criteria, notes,
+		 issue_type, status, priority, ephemeral, created_at, updated_at)
+		VALUES (?, ?, '', '', '', '', ?, ?, ?, 1, NOW(), NOW())`,
 		"fed-optout-wisp", "Wisp for opt-out test", "task", "open", 1)
 	if err != nil {
 		t.Fatalf("insert ephemeral issue: %v", err)
@@ -1248,13 +1250,19 @@ func TestFilteredPushOptOut(t *testing.T) {
 // TestFilteredPushExcludesCustomType verifies that non-wisp types in
 // federation.exclude_types are filtered by issue_type column.
 func TestFilteredPushExcludesCustomType(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := testContext(t)
 	defer cancel()
+	versionWispTablesForFilteredPush(t, ctx, store)
+	observer, err := store.openLongTimeoutConn()
+	if err != nil {
+		t.Fatalf("open staging observer: %v", err)
+	}
+	defer observer.Close()
 
-	// Create a task and a message.
+	// Create a task and a permanent non-infrastructure issue type.
 	task := &types.Issue{
 		ID:        "fed-custom-task",
 		Title:     "Regular task",
@@ -1264,10 +1272,10 @@ func TestFilteredPushExcludesCustomType(t *testing.T) {
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
-	msg := &types.Issue{
-		ID:        "fed-custom-msg",
-		Title:     "Internal message",
-		IssueType: types.TypeMessage,
+	chore := &types.Issue{
+		ID:        "fed-custom-chore",
+		Title:     "Internal chore",
+		IssueType: types.TypeChore,
 		Status:    types.StatusOpen,
 		Priority:  1,
 		CreatedAt: time.Now(),
@@ -1276,8 +1284,8 @@ func TestFilteredPushExcludesCustomType(t *testing.T) {
 	if err := store.CreateIssue(ctx, task, "test"); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	if err := store.CreateIssue(ctx, msg, "test"); err != nil {
-		t.Fatalf("create message: %v", err)
+	if err := store.CreateIssue(ctx, chore, "test"); err != nil {
+		t.Fatalf("create chore: %v", err)
 	}
 	if err := store.Commit(ctx, "create test issues"); err != nil {
 		if !isDoltNothingToCommit(err) {
@@ -1285,21 +1293,66 @@ func TestFilteredPushExcludesCustomType(t *testing.T) {
 		}
 	}
 
-	// Exclude "message" type — task should remain, message should be filtered.
-	pushErr := store.filteredPushToPeer(ctx, "nonexistent-peer", []string{"message"})
-	if pushErr == nil {
-		t.Fatal("expected push error for nonexistent peer")
+	// Hold the shared pool after staging is committed and before peer lookup so
+	// the staging ref can be inspected before its cleanup runs.
+	store.db.SetMaxIdleConns(0)
+	store.db.SetMaxOpenConns(1)
+	held, err := store.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("exhaust shared pool: %v", err)
+	}
+	defer held.Close()
+	initialWaitCount := store.db.Stats().WaitCount
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- store.filteredPushToPeer(ctx, "nonexistent-peer", []string{"chore"})
+	}()
+	waitForPoolWait(t, ctx, store.db, initialWaitCount)
+
+	stagingBranches := listFederationStagingBranches(t, ctx, observer)
+	if len(stagingBranches) != 1 {
+		t.Fatalf("staging branches = %v, want exactly one", stagingBranches)
+	}
+	stagingBranch := stagingBranches[0]
+	if err := issueops.ValidateRef(stagingBranch); err != nil {
+		t.Fatalf("generated staging branch %q is invalid: %v", stagingBranch, err)
+	}
+	//nolint:gosec // stagingBranch is generated internally and validated as a Dolt ref above.
+	taskQuery := fmt.Sprintf("SELECT COUNT(*) FROM issues AS OF '%s' WHERE id = ?", stagingBranch)
+	//nolint:gosec // stagingBranch is generated internally and validated as a Dolt ref above.
+	choreQuery := fmt.Sprintf("SELECT COUNT(*) FROM issues AS OF '%s' WHERE id = ?", stagingBranch)
+	var stagedTaskCount, stagedChoreCount int
+	if err := observer.QueryRowContext(ctx, taskQuery, "fed-custom-task").Scan(&stagedTaskCount); err != nil {
+		t.Fatalf("count task on staging branch: %v", err)
+	}
+	if err := observer.QueryRowContext(ctx, choreQuery, "fed-custom-chore").Scan(&stagedChoreCount); err != nil {
+		t.Fatalf("count chore on staging branch: %v", err)
+	}
+	if stagedTaskCount != 1 || stagedChoreCount != 0 {
+		t.Fatalf("staging branch task count = %d, chore count = %d, want 1, 0", stagedTaskCount, stagedChoreCount)
 	}
 
+	if err := held.Close(); err != nil {
+		t.Fatalf("release shared pool: %v", err)
+	}
+	if pushErr := <-errCh; pushErr == nil {
+		t.Fatal("expected push error for nonexistent peer")
+	}
+	assertFederationStagingBranchAbsent(t, ctx, observer)
+
 	// Verify original branch still has both issues.
-	var taskCount, msgCount int
-	store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues WHERE id = ?", "fed-custom-task").Scan(&taskCount)
-	store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues WHERE id = ?", "fed-custom-msg").Scan(&msgCount)
+	var taskCount, choreCount int
+	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues WHERE id = ?", "fed-custom-task").Scan(&taskCount); err != nil {
+		t.Fatalf("count task: %v", err)
+	}
+	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues WHERE id = ?", "fed-custom-chore").Scan(&choreCount); err != nil {
+		t.Fatalf("count chore: %v", err)
+	}
 	if taskCount != 1 {
 		t.Errorf("task should survive on original branch")
 	}
-	if msgCount != 1 {
-		t.Errorf("message should survive on original branch (filter is non-destructive)")
+	if choreCount != 1 {
+		t.Errorf("chore should survive on original branch (filter is non-destructive)")
 	}
 }
 
