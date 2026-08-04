@@ -1,6 +1,9 @@
 package dolt
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -56,7 +59,31 @@ func TestIssueOperationsClaimVerifyPostcondition(t *testing.T) {
 			rejects:      [][2]string{{"alice", "in_progress"}},
 		},
 		{
-			name: "claim that moves the issue to a wisp is not verified",
+			name: "claim with an ordinary scalar patch is not verified",
+			request: publicops.UpdateRequest{Actor: "alice", IssueID: "bd-1", Claim: true, Patch: publicops.IssuePatch{
+				Title: publicops.Field[string]{Set: true, Value: "new title"},
+			}},
+		},
+		{
+			name: "claim with a labels patch is not verified",
+			request: publicops.UpdateRequest{Actor: "alice", IssueID: "bd-1", Claim: true, Patch: publicops.IssuePatch{
+				Labels: publicops.LabelPatch{Add: []string{"label"}},
+			}},
+		},
+		{
+			name: "claim with a metadata patch is not verified",
+			request: publicops.UpdateRequest{Actor: "alice", IssueID: "bd-1", Claim: true, Patch: publicops.IssuePatch{
+				Metadata: publicops.MetadataPatch{Set: map[string]json.RawMessage{"key": json.RawMessage(`"value"`)}},
+			}},
+		},
+		{
+			name: "claim with a parent patch is not verified",
+			request: publicops.UpdateRequest{Actor: "alice", IssueID: "bd-1", Claim: true, Patch: publicops.IssuePatch{
+				ParentID: publicops.Field[string]{Set: true, Value: "parent"},
+			}},
+		},
+		{
+			name: "claim with a persistence patch is not verified",
 			request: publicops.UpdateRequest{Actor: "alice", IssueID: "bd-1", Claim: true, Patch: publicops.IssuePatch{
 				Persistence: publicops.Field[publicops.PersistenceMode]{Set: true, Value: publicops.PersistenceModeEphemeral},
 			}},
@@ -118,6 +145,37 @@ func TestIssueOperationsClaimVerifyPostcondition(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestIssueOperationsClaimVerifyDoesNotMaskIndeterminateMixedClaim proves a
+// facade claim with an ordinary patch cannot infer that patch landed merely
+// from matching preexisting coordination state.
+func TestIssueOperationsClaimVerifyDoesNotMaskIndeterminateMixedClaim(t *testing.T) {
+	s, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	s.serverMode = true
+
+	id := claimVerifyTestIssue(t, s)
+	if err := rawClaim(t, s, id, "alice"); err != nil {
+		t.Fatalf("seed matching coordination state: %v", err)
+	}
+	operations := &issueOperations{store: s}
+	indeterminate := fmt.Errorf("write commit result indeterminate: %w", ErrCommitIndeterminate)
+	err := operations.verifiedUpdate(ctx, publicops.UpdateRequest{
+		Actor:   "alice",
+		IssueID: id,
+		Claim:   true,
+		Patch: publicops.IssuePatch{
+			Title: publicops.Field[string]{Set: true, Value: "must not be inferred"},
+		},
+	}, func() error {
+		return indeterminate
+	})
+	if !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("mixed facade claim error = %v, want ErrCommitIndeterminate", err)
 	}
 }
 

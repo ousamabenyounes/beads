@@ -62,13 +62,12 @@ func (o *issueOperations) Update(ctx context.Context, request issueops.UpdateReq
 	return result, err
 }
 
-// verifiedUpdate runs a facade update under claim-family verify-after-write
-// (bd-zccb9) when the request writes coordination state, and unwrapped
-// otherwise. The facade reaches the same writes as ClaimIssue and
-// UpdateIssueWithOptions, so under a degraded server its exit status is no more
-// trustworthy than theirs. Replay is safe: the claim CAS and the compare-and-set
-// guards are re-checked inside the replayed transaction, so a racing writer
-// makes the replay refuse rather than clobber.
+// verifiedUpdate verifies a coordination-only claim or a qualifying guarded
+// update after a write (bd-zccb9), and preserves the write outcome otherwise.
+// A re-read of assignee and status cannot prove an ordinary patch or its event
+// landed, even when the claim state already matches. The facade reaches the
+// same writes as ClaimIssue and UpdateIssueWithOptions, so under a degraded
+// server its exit status is no more trustworthy than theirs.
 func (o *issueOperations) verifiedUpdate(ctx context.Context, request issueops.UpdateRequest, write func() error) error {
 	post, verify := updateClaimPostcondition(request)
 	if !verify {
@@ -78,16 +77,26 @@ func (o *issueOperations) verifiedUpdate(ctx context.Context, request issueops.U
 }
 
 // updateClaimPostcondition derives the row state a facade update must leave
-// behind to count as applied, and whether the update is claim-family at all. A
-// claim always is; an ordinary update is only when a compare-and-set guard
-// authorizes a write to assignee or status. The postcondition describes the
-// state the request intends, so a patch that overrides the claim's own
-// assignee or status is honored rather than read as a lost write.
-//
-// A request that also moves the issue across the persistence boundary is
-// exempt: the row can legitimately leave the issues table mid-write, which the
-// re-read would report as an unverifiable claim.
+// behind to count as applied, and whether that state is enough to prove the
+// whole update. A claim is verifiable only when its patch changes no state
+// beyond assignee and status. An ordinary update is verifiable only when a
+// compare-and-set guard authorizes a write to assignee or status. The
+// postcondition honors a coordination-only claim patch that overrides the
+// claim's own assignee or status.
 func updateClaimPostcondition(request issueops.UpdateRequest) (claimPostcondition, bool) {
+	if request.Claim {
+		if hasNonCoordinationClaimPatch(request.Patch) {
+			return claimPostcondition{}, false
+		}
+		assignee, status := request.Actor, types.StatusInProgress
+		if request.Patch.Assignee.Set {
+			assignee = request.Patch.Assignee.Value
+		}
+		if request.Patch.Status.Set {
+			status = request.Patch.Status.Value
+		}
+		return claimedAs(assignee, status), true
+	}
 	if request.Patch.Persistence.Set {
 		return claimPostcondition{}, false
 	}
@@ -98,22 +107,43 @@ func updateClaimPostcondition(request issueops.UpdateRequest) (claimPostconditio
 	if request.Patch.Status.Set {
 		updates["status"] = string(request.Patch.Status.Value)
 	}
-	if request.Claim {
-		assignee, status := request.Actor, types.StatusInProgress
-		if request.Patch.Assignee.Set {
-			assignee = request.Patch.Assignee.Value
-		}
-		if request.Patch.Status.Set {
-			status = request.Patch.Status.Value
-		}
-		return claimedAs(assignee, status), true
-	}
 	opts := storage.UpdateIssueOptions{ExpectedAssignee: request.ExpectedAssignee}
 	if request.ExpectedStatus != nil {
 		expected := string(*request.ExpectedStatus)
 		opts.ExpectedStatus = &expected
 	}
 	return guardedUpdatePostcondition(opts, updates)
+}
+
+// hasNonCoordinationClaimPatch reports whether a claim also changes state that
+// an assignee/status re-read cannot prove. Keep this explicit so every patch
+// operation is visibly classified without making the request shape reflective.
+func hasNonCoordinationClaimPatch(patch issueops.IssuePatch) bool {
+	return patch.Title.Set ||
+		patch.Description.Set ||
+		patch.Design.Set ||
+		patch.AcceptanceCriteria.Set ||
+		patch.Notes.Set ||
+		patch.AppendNotes.Set ||
+		patch.SpecID.Set ||
+		patch.AwaitID.Set ||
+		patch.Priority.Set ||
+		patch.IssueType.Set ||
+		patch.Owner.Set ||
+		patch.ClosedBySession.Set ||
+		patch.EstimatedMinutes.Set ||
+		patch.ExternalRef.Set ||
+		patch.DueAt.Set ||
+		patch.DeferUntil.Set ||
+		patch.Persistence.Set ||
+		patch.ParentID.Set ||
+		len(patch.Labels.Add) != 0 ||
+		len(patch.Labels.Remove) != 0 ||
+		patch.Labels.Replace.Set ||
+		len(patch.Metadata.Set) != 0 ||
+		len(patch.Metadata.Unset) != 0 ||
+		patch.Metadata.Replace.Set ||
+		patch.Metadata.Merge.Set
 }
 
 func (o *issueOperations) Close(ctx context.Context, request issueops.CloseRequest) (issueops.CloseResult, error) {
