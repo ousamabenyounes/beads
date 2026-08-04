@@ -98,14 +98,14 @@ func TestVerifiedReadyClaimDoesNotReplayDefiniteMySQLError(t *testing.T) {
 	}
 }
 
-// TestVerifiedClaimWriteConvertsAppliedIndeterminate: the wy-x543k direction —
-// the write actually landed but the connection died during commit and bd
-// printed an error. Verify-by-re-read must convert it into an accurate success.
-func TestVerifiedClaimWriteConvertsAppliedIndeterminate(t *testing.T) {
+// TestVerifiedClaimWriteRetainsAppliedIndeterminate proves matching issue
+// fields alone do not prove the lease and actor-attributed event also landed.
+func TestVerifiedClaimWriteRetainsAppliedIndeterminate(t *testing.T) {
 	s, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx, cancel := testContext(t)
 	defer cancel()
+	s.serverMode = true
 
 	id := claimVerifyTestIssue(t, s)
 	if err := rawClaim(t, s, id, "alice"); err != nil {
@@ -117,8 +117,8 @@ func TestVerifiedClaimWriteConvertsAppliedIndeterminate(t *testing.T) {
 		calls++
 		return fmt.Errorf("write commit result indeterminate after connection loss: i/o timeout (%w)", ErrCommitIndeterminate)
 	})
-	if err != nil {
-		t.Fatalf("expected applied-indeterminate to resolve to success, got: %v", err)
+	if !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("applied-indeterminate error = %v, want ErrCommitIndeterminate", err)
 	}
 	if calls != 1 {
 		t.Fatalf("write must not be replayed when the re-read shows it applied; ran %d times", calls)

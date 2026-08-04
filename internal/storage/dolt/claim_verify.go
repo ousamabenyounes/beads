@@ -3,7 +3,6 @@ package dolt
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -30,9 +29,8 @@ import (
 //
 //   - reported success        -> verify; a mismatch fails LOUDLY (the caller
 //     must know it does not hold the claim)
-//   - ambiguous commit loss   -> (ErrCommitIndeterminate, surfaced by
-//     withRetryTx) verify; applied -> success, every other outcome returns the
-//     original indeterminate error without replaying a mutation
+//   - ambiguous commit loss   -> retain ErrCommitIndeterminate. Assignee and
+//     status alone cannot prove the lease and actor-attributed event landed.
 //   - any other error         -> honest failure (CAS lost, not-claimable, or
 //     pre-commit errors withRetryTx already retried); no verify needed
 //
@@ -184,7 +182,7 @@ func (s *DoltStore) verifiedClaimWrite(ctx context.Context, id string, post clai
 		return write()
 	}
 	err := write()
-	if err != nil && !errors.Is(err, ErrCommitIndeterminate) {
+	if err != nil {
 		return err
 	}
 	assignee, status, verr := s.readClaimState(ctx, id)
@@ -196,14 +194,7 @@ func (s *DoltStore) verifiedClaimWrite(ctx context.Context, id string, post clai
 			post.op, id, verr, post.op)
 	}
 	if post.want(assignee, status) {
-		if err != nil {
-			doltMetrics.claimVerifyRecovered.Add(ctx, 1, metric.WithAttributes(
-				attribute.String("op", post.op), attribute.String("outcome", "applied")))
-		}
 		return nil
-	}
-	if err != nil {
-		return err
 	}
 	doltMetrics.claimVerifyLost.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("op", post.op)))

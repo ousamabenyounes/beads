@@ -238,6 +238,34 @@ func TestIssueOperationsClaimVerifyDoesNotMaskIndeterminateMixedClaim(t *testing
 	}
 }
 
+func TestIssueOperationsClaimCoordinationPatchRetainsIndeterminate(t *testing.T) {
+	s, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	s.serverMode = true
+
+	id := claimVerifyTestIssue(t, s)
+	if err := rawClaim(t, s, id, "alice"); err != nil {
+		t.Fatalf("seed matching claim state: %v", err)
+	}
+	operations := &issueOperations{store: s}
+	indeterminate := fmt.Errorf("write commit result indeterminate: %w", ErrCommitIndeterminate)
+	err := operations.verifiedUpdate(ctx, publicops.UpdateRequest{
+		Actor:   "alice",
+		IssueID: id,
+		Claim:   true,
+		Patch: publicops.IssuePatch{
+			Status: publicops.Field[publicops.Status]{Set: true, Value: types.StatusInProgress},
+		},
+	}, func() error {
+		return indeterminate
+	})
+	if !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("coordination claim error = %v, want ErrCommitIndeterminate", err)
+	}
+}
+
 // TestIssueOperationsClaimVerifyFailsLoudlyOnLostFacadeClaim: a facade claim
 // whose transaction reports success without landing must fail loudly, exactly
 // like the store's own ClaimIssue. A silent phantom claim through the facade
