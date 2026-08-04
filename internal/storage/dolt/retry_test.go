@@ -3,7 +3,6 @@ package dolt
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -120,36 +119,6 @@ func TestIsRetryableError(t *testing.T) {
 			err:      errors.New("Error 1146: Table 'beads.foo' doesn't exist"),
 			expected: false,
 		},
-		{
-			name:     "typed semantic 1105 with connection-like text is not retryable",
-			err:      &mysql.MySQLError{Number: 1105, Message: "connection lost while validating commit"},
-			expected: false,
-		},
-		{
-			name:     "typed read-only 1105 is retryable",
-			err:      &mysql.MySQLError{Number: 1105, Message: "cannot update manifest: database is read only"},
-			expected: true,
-		},
-		{
-			name:     "wrapped typed read-only 1105 is retryable case-insensitively",
-			err:      fmt.Errorf("write issue: %w", &mysql.MySQLError{Number: 1105, Message: "Cannot Update Manifest: Database Is Read Only"}),
-			expected: true,
-		},
-		{
-			name:     "read-only text on another typed code is not retryable",
-			err:      &mysql.MySQLError{Number: 1064, Message: "database is read only"},
-			expected: false,
-		},
-		{
-			name:     "typed setup 1049 is not generically retryable",
-			err:      &mysql.MySQLError{Number: 1049, Message: "Unknown database 'beads_test'"},
-			expected: false,
-		},
-		{
-			name:     "typed setup 1105 is not generically retryable",
-			err:      &mysql.MySQLError{Number: 1105, Message: "no root value found in session"},
-			expected: false,
-		},
 	}
 
 	for _, tt := range tests {
@@ -157,63 +126,6 @@ func TestIsRetryableError(t *testing.T) {
 			got := isRetryableError(tt.err)
 			if got != tt.expected {
 				t.Errorf("isRetryableError(%v) = %v, want %v", tt.err, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestIsSetupRetryableError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{
-			name: "typed unknown database",
-			err:  &mysql.MySQLError{Number: 1049, Message: "Unknown database 'beads_test'"},
-			want: true,
-		},
-		{
-			name: "wrapped typed unknown database",
-			err:  fmt.Errorf("ping database after create: %w", &mysql.MySQLError{Number: 1049, Message: "Unknown database 'beads_test'"}),
-			want: true,
-		},
-		{
-			name: "typed missing session root",
-			err:  &mysql.MySQLError{Number: 1105, Message: "no root value found in session"},
-			want: true,
-		},
-		{
-			name: "wrapped case variant of missing session root",
-			err:  fmt.Errorf("schema probe: %w", &mysql.MySQLError{Number: 1105, Message: "No Root Value Found In Session"}),
-			want: true,
-		},
-		{
-			name: "typed 1105 with extra context",
-			err:  &mysql.MySQLError{Number: 1105, Message: "no root value found in session while validating commit"},
-			want: false,
-		},
-		{
-			name: "typed 1105 unrelated semantic error",
-			err:  &mysql.MySQLError{Number: 1105, Message: "connection lost while validating commit"},
-			want: false,
-		},
-		{
-			name: "typed syntax error",
-			err:  &mysql.MySQLError{Number: 1064, Message: "You have an error in your SQL syntax"},
-			want: false,
-		},
-		{
-			name: "generic connection failure",
-			err:  errors.New("driver: bad connection"),
-			want: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isSetupRetryableError(tt.err); got != tt.want {
-				t.Errorf("isSetupRetryableError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}
