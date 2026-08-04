@@ -440,15 +440,17 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	if len(excludeTypes) == 0 {
 		return s.PushTo(ctx, peer)
 	}
+	sourceBranch := s.branch
 
-	// Pin a single long-timeout connection for the complete session-scoped
-	// staging lifecycle. RecomputeAllIsBlockedInTx can exceed the shared
-	// pool's 10-second I/O deadline, and branch state is connection-scoped.
+	// Pin a single long-timeout connection for the session-scoped staging
+	// operation. RecomputeAllIsBlockedInTx can exceed the shared pool's
+	// 10-second I/O deadline, and branch state is connection-scoped.
 	db, err := s.openLongTimeoutConn()
 	if err != nil {
 		return fmt.Errorf("federation filter: open long-timeout connection: %w", err)
 	}
 	defer db.Close()
+	db.SetMaxIdleConns(0)
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("federation filter: acquire long-timeout connection: %w", err)
@@ -459,20 +461,30 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	_ = schema.DrainCall(ctx, conn, "CALL DOLT_BRANCH('-Df', ?)", federationStagingBranch)
 
 	// Create staging branch from the current branch.
-	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?, ?)", federationStagingBranch, s.branch); err != nil {
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?, ?)", federationStagingBranch, sourceBranch); err != nil {
 		return fmt.Errorf("federation filter: create staging branch: %w", err)
 	}
 
-	// Ensure cleanup: restore original branch and delete staging.
+	// Ensure cleanup on a fresh connection: canceling an in-flight query makes
+	// go-sql-driver/mysql invalidate the operation connection.
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), federationStagingCleanupTimeout)
 		defer cancel()
 		var cleanupErr error
-		if err := schema.DrainCall(cleanupCtx, conn, "CALL DOLT_CHECKOUT(?)", s.branch); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("restore branch %s: %w", s.branch, err))
+		if err := conn.Close(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("discard operation connection: %w", err))
 		}
-		if err := schema.DrainCall(cleanupCtx, conn, "CALL DOLT_BRANCH('-Df', ?)", federationStagingBranch); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete staging branch: %w", err))
+		cleanupConn, err := db.Conn(cleanupCtx)
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("acquire cleanup connection: %w", err))
+		} else {
+			defer cleanupConn.Close()
+			if err := schema.DrainCall(cleanupCtx, cleanupConn, "CALL DOLT_CHECKOUT(?)", sourceBranch); err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("restore branch %s: %w", sourceBranch, err))
+			}
+			if err := schema.DrainCall(cleanupCtx, cleanupConn, "CALL DOLT_BRANCH('-Df', ?)", federationStagingBranch); err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete staging branch: %w", err))
+			}
 		}
 		if cleanupErr != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("federation filter: cleanup: %w", cleanupErr))
@@ -508,12 +520,12 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	}
 
 	// Restore original branch context before pushing.
-	if err := versioncontrolops.CheckoutBranch(ctx, conn, s.branch); err != nil {
-		return fmt.Errorf("federation filter: restore branch %s: %w", s.branch, err)
+	if err := versioncontrolops.CheckoutBranch(ctx, conn, sourceBranch); err != nil {
+		return fmt.Errorf("federation filter: restore branch %s: %w", sourceBranch, err)
 	}
 
 	// Push staging branch to peer, mapped to the peer's expected branch name.
-	refspec := federationStagingBranch + ":" + s.branch
+	refspec := federationStagingBranch + ":" + sourceBranch
 	return s.pushRefToPeer(ctx, peer, refspec)
 }
 

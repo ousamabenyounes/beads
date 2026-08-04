@@ -610,11 +610,10 @@ func TestFilteredPushUsesDedicatedLongTimeoutConnection(t *testing.T) {
 	assertFederationStagingBranchAbsent(t, ctx, observer)
 }
 
-// TestFilteredPushCleanupSurvivesCallerCancellation cancels the caller only
-// after the durable filtered staging commit and the subsequent peer lookup are
-// observable. Cleanup must still restore/delete on its pinned connection. A
-// deliberately invalid restore target also proves its cleanup error is joined
-// without masking the caller's cancellation, while deletion still runs.
+// TestFilteredPushCleanupSurvivesCallerCancellation cancels the caller while
+// the staging DELETE is executing. go-sql-driver/mysql invalidates that
+// operation connection on cancellation, so cleanup must discard it, reopen a
+// connection, restore the source branch, and delete the staging branch.
 func TestFilteredPushCleanupSurvivesCallerCancellation(t *testing.T) {
 	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
@@ -622,11 +621,102 @@ func TestFilteredPushCleanupSurvivesCallerCancellation(t *testing.T) {
 	defer cancel()
 
 	waiterID, blockerID := seedFilteredPushGraph(t, ctx, store, "fed-cancel-cleanup")
+	sourceBranch := store.branch
+	setupConn, err := store.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin cancellation fixture connection: %v", err)
+	}
+	if _, err := setupConn.ExecContext(ctx,
+		"CREATE TABLE federation_cancel_gate (slept INT NOT NULL)"); err != nil {
+		_ = setupConn.Close()
+		t.Fatalf("create cancellation gate table: %v", err)
+	}
+	if _, err := setupConn.ExecContext(ctx, `CREATE TRIGGER federation_cancel_delete
+		BEFORE DELETE ON issues FOR EACH ROW
+		INSERT INTO federation_cancel_gate VALUES (SLEEP(60))`); err != nil {
+		_ = setupConn.Close()
+		t.Fatalf("create cancellation gate trigger: %v", err)
+	}
+	if err := schema.DrainCall(ctx, setupConn,
+		"CALL DOLT_COMMIT('-Am', 'test: block filtered delete for cancellation')"); err != nil {
+		_ = setupConn.Close()
+		t.Fatalf("commit cancellation fixture: %v", err)
+	}
+	if err := setupConn.Close(); err != nil {
+		t.Fatalf("close cancellation fixture connection: %v", err)
+	}
+
 	observer, err := store.openLongTimeoutConn()
 	if err != nil {
 		t.Fatalf("open staging observer: %v", err)
 	}
 	defer observer.Close()
+
+	pushCtx, cancelPush := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- store.filteredPushToPeer(pushCtx, "nonexistent-peer", []string{"wisp"})
+	}()
+
+	waitForFederationQuery(t, ctx, observer, errCh, store.database, "DELETE FROM issues WHERE ephemeral = 1")
+	cancelPush()
+	select {
+	case err = <-errCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("filtered push did not return after canceling its staging query")
+	}
+	if err == nil {
+		t.Fatal("filtered push succeeded after canceling its staging query")
+	}
+	if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "bad connection") {
+		t.Fatalf("filtered push error = %v, want cancellation or invalidated connection", err)
+	}
+
+	if err := versioncontrolops.CheckoutBranch(ctx, observer, sourceBranch); err != nil {
+		t.Fatalf("checkout source branch after cancellation: %v", err)
+	}
+	var activeBranch string
+	if err := observer.QueryRowContext(ctx, "SELECT active_branch()").Scan(&activeBranch); err != nil {
+		t.Fatalf("read branch after cancellation: %v", err)
+	}
+	if activeBranch != sourceBranch {
+		t.Fatalf("active branch after cancellation = %q, want source %q", activeBranch, sourceBranch)
+	}
+	var blockerCount int
+	if err := observer.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM issues WHERE id = ?", blockerID).Scan(&blockerCount); err != nil {
+		t.Fatalf("read excluded blocker on source branch: %v", err)
+	}
+	waiterBlocked := isBlocked(ctx, t, observer, waiterID)
+	if blockerCount != 1 || !waiterBlocked {
+		t.Fatalf("source state changed after cancellation: blocker count = %d, waiter blocked = %t, want 1, true",
+			blockerCount, waiterBlocked)
+	}
+	assertFederationStagingBranchAbsent(t, ctx, observer)
+}
+
+// TestFilteredPushCleanupDeletesStagingAfterRestoreFailure proves cleanup
+// attempts branch deletion even when restoring the captured source fails, and
+// joins that cleanup failure with the caller's cancellation.
+func TestFilteredPushCleanupDeletesStagingAfterRestoreFailure(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	waiterID, blockerID := seedFilteredPushGraph(t, ctx, store, "fed-cleanup-join")
+	observer, err := store.openLongTimeoutConn()
+	if err != nil {
+		t.Fatalf("open staging observer: %v", err)
+	}
+	defer observer.Close()
+
+	sourceBranch := "federation-cleanup-missing-source"
+	if err := schema.DrainCall(ctx, observer,
+		"CALL DOLT_BRANCH(?, ?)", sourceBranch, store.branch); err != nil {
+		t.Fatalf("create disposable source branch: %v", err)
+	}
+	store.branch = sourceBranch
 
 	store.db.SetMaxOpenConns(1)
 	held, err := store.db.Conn(ctx)
@@ -644,17 +734,93 @@ func TestFilteredPushCleanupSurvivesCallerCancellation(t *testing.T) {
 
 	waitForFilteredStagingCommit(t, ctx, observer, errCh, waiterID, blockerID)
 	waitForPoolWait(t, ctx, store.db, initialWaitCount)
-	store.branch = "missing-cleanup-branch"
+	if err := schema.DrainCall(ctx, observer,
+		"CALL DOLT_BRANCH('-Df', ?)", sourceBranch); err != nil {
+		t.Fatalf("delete disposable source branch: %v", err)
+	}
 	cancelPush()
-	err = <-errCh
+	select {
+	case err = <-errCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("filtered push did not return after caller cancellation")
+	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("filtered push error = %v, want context canceled", err)
 	}
 	if !strings.Contains(err.Error(), "federation filter: cleanup") ||
-		!strings.Contains(err.Error(), "restore branch missing-cleanup-branch") {
-		t.Fatalf("filtered push error omitted cleanup failure: %v", err)
+		!strings.Contains(err.Error(), "restore branch "+sourceBranch) {
+		t.Fatalf("filtered push error omitted cleanup restore failure: %v", err)
 	}
 	assertFederationStagingBranchAbsent(t, ctx, observer)
+}
+
+func waitForFederationQuery(t *testing.T, ctx context.Context, observer *sql.DB, errCh <-chan error, database, querySnippet string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			t.Fatalf("filtered push returned before staging query was observable: %v", err)
+		default:
+		}
+		visible, err := processlistContainsQuery(ctx, observer, database, querySnippet)
+		if err != nil {
+			t.Fatalf("observe staging query: %v", err)
+		}
+		if visible {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("waiting for staging query: %v", ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatalf("staging query %q was not observable", querySnippet)
+}
+
+func processlistContainsQuery(ctx context.Context, observer *sql.DB, database, querySnippet string) (bool, error) {
+	rows, err := observer.QueryContext(ctx, "SHOW PROCESSLIST")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return false, err
+	}
+	infoIndex := -1
+	databaseIndex := -1
+	for i, column := range columns {
+		switch {
+		case strings.EqualFold(column, "info"):
+			infoIndex = i
+		case strings.EqualFold(column, "db"):
+			databaseIndex = i
+		}
+	}
+	if infoIndex < 0 || databaseIndex < 0 {
+		return false, errors.New("SHOW PROCESSLIST has no db or info column")
+	}
+	values := make([]sql.NullString, len(columns))
+	scanArgs := make([]any, len(columns))
+	for i := range values {
+		scanArgs[i] = &values[i]
+	}
+	querySnippet = strings.ToLower(querySnippet)
+	for rows.Next() {
+		for i := range values {
+			values[i] = sql.NullString{}
+		}
+		if err := rows.Scan(scanArgs...); err != nil {
+			return false, err
+		}
+		if values[databaseIndex].Valid && values[databaseIndex].String == database &&
+			values[infoIndex].Valid && strings.Contains(strings.ToLower(values[infoIndex].String), querySnippet) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func seedFilteredPushGraph(t *testing.T, ctx context.Context, store *DoltStore, prefix string) (string, string) {
