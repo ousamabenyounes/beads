@@ -265,6 +265,33 @@ func TestCommitCommitResponseLossIsIndeterminate(t *testing.T) {
 	}
 }
 
+func TestCommitPropagatesDoltAddFailureBeforeCommit(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	stageErr := errors.New("stage issues failed")
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM dolt_status")).
+		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("issues"))
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+		WithArgs("issues").
+		WillReturnError(stageErr)
+
+	store := &DoltStore{db: db}
+	err = store.Commit(context.Background(), "bd: test commit")
+	if !errors.Is(err, stageErr) {
+		t.Fatalf("Commit() error = %v, want staging cause %v", err, stageErr)
+	}
+	if !strings.Contains(err.Error(), "stage issues") {
+		t.Fatalf("Commit() error = %q, want staging table context", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 func TestDoltAddAndCommitInTxClassifiesCommitResponses(t *testing.T) {
 	for _, tc := range []struct {
 		name              string

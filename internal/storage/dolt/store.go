@@ -2894,15 +2894,7 @@ func (s *DoltStore) commitWorkingSet(ctx context.Context, message string, mode c
 
 	for _, table := range tables {
 		if err := schema.DrainCall(ctx, conn, "CALL DOLT_ADD(?)", table); err != nil {
-			// config when the mode intentionally includes it is the whole reason
-			// we stage here: silently skipping a failed DOLT_ADD('config') would
-			// leave config dirty and re-wedge the merge, so surface it instead.
-			if table == "config" && mode != configExclude {
-				return fmt.Errorf("failed to stage config before commit: %w", err)
-			}
-			// Best effort: some tables may be dolt_ignore'd (e.g., wisps).
-			// DOLT_ADD fails for ignored tables; skip silently.
-			continue
+			return fmt.Errorf("failed to stage %s before commit: %w", table, err)
 		}
 	}
 
