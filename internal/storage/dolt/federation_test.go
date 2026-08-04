@@ -4,6 +4,8 @@ package dolt
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -565,46 +567,227 @@ func TestFilteredPushExcludesWisp(t *testing.T) {
 }
 
 // TestFilteredPushUsesDedicatedLongTimeoutConnection proves the full staging
-// lifecycle does not borrow the shared pool. RecomputeAllIsBlockedInTx can
-// exceed the pool's 10-second I/O deadline, so branch creation, checkout,
-// deletion, recompute, DOLT_COMMIT, and restoration must all run through one
-// pinned connection from the dedicated long-timeout DB before the push begins.
+// lifecycle does not borrow the shared pool. The pool is deliberately
+// exhausted while a separate connection observes the staging branch's durable
+// state: the blocker is deleted, the retained waiter is recomputed unblocked,
+// and the filtering commit is present before peer lookup waits on the pool.
 func TestFilteredPushUsesDedicatedLongTimeoutConnection(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
-
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	// Ensure filtering takes the delete/recompute/DOLT_COMMIT path rather than
-	// skipping it because there was nothing to exclude.
-	if err := store.CreateIssue(ctx, &types.Issue{
-		ID:        "fed-long-timeout-wisp",
-		Title:     "Wisp for long-timeout staging",
-		IssueType: types.TypeTask,
-		Status:    types.StatusOpen,
-		Priority:  1,
-	}, "test"); err != nil {
-		t.Fatalf("create issue: %v", err)
+	waiterID, blockerID := seedFilteredPushGraph(t, ctx, store, "fed-long-timeout")
+	observer, err := store.openLongTimeoutConn()
+	if err != nil {
+		t.Fatalf("open staging observer: %v", err)
 	}
-	if _, err := store.db.ExecContext(ctx, "UPDATE issues SET ephemeral = 1 WHERE id = ?", "fed-long-timeout-wisp"); err != nil {
-		t.Fatalf("mark issue ephemeral: %v", err)
-	}
-	if err := store.Commit(ctx, "seed long-timeout filtered staging"); err != nil && !isDoltNothingToCommit(err) {
-		t.Fatalf("commit filtered staging seed: %v", err)
-	}
+	defer observer.Close()
 
-	// The previous implementation acquired conn from this pool, so closing it
-	// made the first staging step fail. The staging lifecycle must instead use
-	// openLongTimeoutConn and reach the post-staging peer-credential lookup only
-	// after it has restored the source branch.
-	if err := store.db.Close(); err != nil {
-		t.Fatalf("close shared pool: %v", err)
+	store.db.SetMaxOpenConns(1)
+	held, err := store.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("exhaust shared pool: %v", err)
 	}
-	if err := store.filteredPushToPeer(ctx, "nonexistent-peer", []string{"wisp"}); err == nil {
-		t.Fatal("expected peer credential error with shared pool closed")
+	defer held.Close()
+	initialWaitCount := store.db.Stats().WaitCount
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- store.filteredPushToPeer(ctx, "nonexistent-peer", []string{"wisp"})
+	}()
+
+	waitForFilteredStagingCommit(t, ctx, observer, errCh, waiterID, blockerID)
+	waitForPoolWait(t, ctx, store.db, initialWaitCount)
+	if err := held.Close(); err != nil {
+		t.Fatalf("release shared pool: %v", err)
+	}
+	if err := <-errCh; err == nil {
+		t.Fatal("expected peer credential error for nonexistent peer")
 	} else if !strings.Contains(err.Error(), "failed to get peer credentials") {
-		t.Fatalf("staging lifecycle did not complete on dedicated long-timeout connection before peer lookup: %v", err)
+		t.Fatalf("filtered push failed before peer lookup: %v", err)
+	}
+	assertFederationStagingBranchAbsent(t, ctx, observer)
+}
+
+// TestFilteredPushCleanupSurvivesCallerCancellation cancels the caller only
+// after the durable filtered staging commit and the subsequent peer lookup are
+// observable. Cleanup must still restore/delete on its pinned connection. A
+// deliberately invalid restore target also proves its cleanup error is joined
+// without masking the caller's cancellation, while deletion still runs.
+func TestFilteredPushCleanupSurvivesCallerCancellation(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	waiterID, blockerID := seedFilteredPushGraph(t, ctx, store, "fed-cancel-cleanup")
+	observer, err := store.openLongTimeoutConn()
+	if err != nil {
+		t.Fatalf("open staging observer: %v", err)
+	}
+	defer observer.Close()
+
+	store.db.SetMaxOpenConns(1)
+	held, err := store.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("exhaust shared pool: %v", err)
+	}
+	defer held.Close()
+	initialWaitCount := store.db.Stats().WaitCount
+
+	pushCtx, cancelPush := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- store.filteredPushToPeer(pushCtx, "nonexistent-peer", []string{"wisp"})
+	}()
+
+	waitForFilteredStagingCommit(t, ctx, observer, errCh, waiterID, blockerID)
+	waitForPoolWait(t, ctx, store.db, initialWaitCount)
+	store.branch = "missing-cleanup-branch"
+	cancelPush()
+	err = <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("filtered push error = %v, want context canceled", err)
+	}
+	if !strings.Contains(err.Error(), "federation filter: cleanup") ||
+		!strings.Contains(err.Error(), "restore branch missing-cleanup-branch") {
+		t.Fatalf("filtered push error omitted cleanup failure: %v", err)
+	}
+	assertFederationStagingBranchAbsent(t, ctx, observer)
+}
+
+func seedFilteredPushGraph(t *testing.T, ctx context.Context, store *DoltStore, prefix string) (string, string) {
+	t.Helper()
+
+	if err := store.db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&store.branch); err != nil {
+		t.Fatalf("align store source branch: %v", err)
+	}
+	versionWispTablesForFilteredPush(t, ctx, store)
+	waiterID := prefix + "-waiter"
+	blockerID := prefix + "-blocker"
+	if err := store.CreateIssue(ctx, &types.Issue{
+		ID: waiterID, Title: "retained waiter", IssueType: types.TypeBug,
+		Status: types.StatusOpen, Priority: 1,
+	}, "test"); err != nil {
+		t.Fatalf("create waiter: %v", err)
+	}
+	if err := store.CreateIssue(ctx, &types.Issue{
+		ID: blockerID, Title: "excluded blocker", IssueType: types.TypeTask,
+		Status: types.StatusOpen, Priority: 1,
+	}, "test"); err != nil {
+		t.Fatalf("create blocker: %v", err)
+	}
+	if err := store.AddDependency(ctx, &types.Dependency{
+		IssueID: waiterID, DependsOnID: blockerID, Type: types.DepBlocks,
+	}, "test"); err != nil {
+		t.Fatalf("add blocking dependency: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "UPDATE issues SET ephemeral = 1 WHERE id = ?", blockerID); err != nil {
+		t.Fatalf("mark blocker ephemeral: %v", err)
+	}
+	if err := store.Commit(ctx, "seed filtered staging graph"); err != nil && !isDoltNothingToCommit(err) {
+		t.Fatalf("commit filtered staging graph: %v", err)
+	}
+	if !isBlocked(ctx, t, store.db, waiterID) {
+		t.Fatal("precondition: retained waiter must be blocked on source branch")
+	}
+	return waiterID, blockerID
+}
+
+// versionWispTablesForFilteredPush makes the empty clone-local wisp plane
+// visible to fresh sessions in this fixture. Production databases retain
+// their dolt_ignore'd working set, but setupConcurrentTestStore deliberately
+// closes idle sessions; without this fixture commit a newly opened staging
+// connection sees no wisps table and cannot exercise the recompute seam.
+func versionWispTablesForFilteredPush(t *testing.T, ctx context.Context, store *DoltStore) {
+	t.Helper()
+	db, err := store.openLongTimeoutConn()
+	if err != nil {
+		t.Fatalf("open wisp fixture database: %v", err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin wisp fixture connection: %v", err)
+	}
+	defer conn.Close()
+	if err := versioncontrolops.CheckoutBranch(ctx, conn, store.branch); err != nil {
+		t.Fatalf("checkout source branch for wisp fixture: %v", err)
+	}
+	if _, err := schema.MigrateUp(ctx, conn); err != nil {
+		t.Fatalf("materialize ignored schema for wisp fixture: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		"DELETE FROM dolt_ignore WHERE pattern IN ('wisps', 'wisp_%')"); err != nil {
+		t.Fatalf("make wisp fixture tables versionable: %v", err)
+	}
+	if err := schema.DrainCall(ctx, conn, "CALL DOLT_ADD('-A')"); err != nil {
+		t.Fatalf("stage wisp fixture tables: %v", err)
+	}
+	if err := schema.DrainCall(ctx, conn,
+		"CALL DOLT_COMMIT('-m', 'test: version empty wisp plane for filtered push')"); err != nil {
+		t.Fatalf("commit wisp fixture tables: %v", err)
+	}
+}
+
+func waitForFilteredStagingCommit(t *testing.T, ctx context.Context, observer *sql.DB, errCh <-chan error, waiterID, blockerID string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			t.Fatalf("filtered push returned before publishing staging commit: %v", err)
+		default:
+		}
+		var blockerCount, commitCount int
+		var blocked bool
+		blockerErr := observer.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM issues AS OF '__federation_push_staging' WHERE id = ?", blockerID,
+		).Scan(&blockerCount)
+		blockedErr := observer.QueryRowContext(ctx,
+			"SELECT is_blocked FROM issues AS OF '__federation_push_staging' WHERE id = ?", waiterID,
+		).Scan(&blocked)
+		commitErr := observer.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM dolt_log('__federation_push_staging') WHERE message = ?",
+			"federation: exclude private issue types",
+		).Scan(&commitCount)
+		lastErr = errors.Join(blockerErr, blockedErr, commitErr)
+		if lastErr == nil && blockerCount == 0 && !blocked && commitCount == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("filtered staging commit was not durably observable: %v", lastErr)
+}
+
+func waitForPoolWait(t *testing.T, ctx context.Context, db *sql.DB, initialWaitCount int64) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if db.Stats().WaitCount > initialWaitCount {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("waiting for peer lookup to block on shared pool: %v", ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatal("peer lookup did not block on the exhausted shared pool")
+}
+
+func assertFederationStagingBranchAbsent(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM dolt_branches WHERE name = ?", federationStagingBranch,
+	).Scan(&count); err != nil {
+		t.Fatalf("query federation staging branch: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("federation staging branch count = %d, want 0", count)
 	}
 }
 

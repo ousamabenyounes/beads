@@ -20,6 +20,10 @@ import (
 // issue types before pushing to a federation peer.
 const federationStagingBranch = "__federation_push_staging"
 
+// federationStagingCleanupTimeout bounds best-effort cleanup after the caller
+// has canceled or its deadline has expired.
+const federationStagingCleanupTimeout = 30 * time.Second
+
 // FederatedStorage implementation for DoltStore
 // These methods enable peer-to-peer synchronization between workspaces.
 
@@ -432,7 +436,7 @@ func (s *DoltStore) Sync(ctx context.Context, peer string, strategy string) (*Sy
 // The special type "wisp" matches issues with ephemeral=true in the committed
 // issues table. Wisps normally live in dolt_ignore'd tables and are not pushed,
 // so this acts as a defense-in-depth safety net.
-func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, excludeTypes []string) error {
+func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, excludeTypes []string) (retErr error) {
 	if len(excludeTypes) == 0 {
 		return s.PushTo(ctx, peer)
 	}
@@ -461,8 +465,18 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 
 	// Ensure cleanup: restore original branch and delete staging.
 	defer func() {
-		_ = schema.DrainCall(ctx, conn, "CALL DOLT_CHECKOUT(?)", s.branch)
-		_ = schema.DrainCall(ctx, conn, "CALL DOLT_BRANCH('-Df', ?)", federationStagingBranch)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), federationStagingCleanupTimeout)
+		defer cancel()
+		var cleanupErr error
+		if err := schema.DrainCall(cleanupCtx, conn, "CALL DOLT_CHECKOUT(?)", s.branch); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("restore branch %s: %w", s.branch, err))
+		}
+		if err := schema.DrainCall(cleanupCtx, conn, "CALL DOLT_BRANCH('-Df', ?)", federationStagingBranch); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete staging branch: %w", err))
+		}
+		if cleanupErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("federation filter: cleanup: %w", cleanupErr))
+		}
 	}()
 
 	// Checkout staging branch.
