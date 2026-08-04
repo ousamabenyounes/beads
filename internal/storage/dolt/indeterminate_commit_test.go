@@ -141,6 +141,78 @@ func TestWithRetryTxIndeterminateCommitFailuresTripCircuitWithoutReplay(t *testi
 			t.Fatalf("circuit state after attempt %d = %q, want %q", attempt, got, wantState)
 		}
 	}
+
+	beginCalls := driver.begins.Load()
+	callbackCalls := callbacks.Load()
+	mutationCalls := driver.execs.Load()
+	err := store.withRetryTx(ctx, func(tx *sql.Tx) error {
+		callbacks.Add(1)
+		_, execErr := tx.ExecContext(ctx, "UPDATE issues SET title = ?", "replayed")
+		return execErr
+	})
+	if !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("withRetryTx() after circuit opened error = %v, want ErrCircuitOpen", err)
+	}
+	if got := driver.begins.Load(); got != beginCalls {
+		t.Fatalf("transaction begins after circuit opened = %d, want unchanged %d", got, beginCalls)
+	}
+	if got := callbacks.Load(); got != callbackCalls {
+		t.Fatalf("callback calls after circuit opened = %d, want unchanged %d", got, callbackCalls)
+	}
+	if got := driver.execs.Load(); got != mutationCalls {
+		t.Fatalf("SQL mutations after circuit opened = %d, want unchanged %d", got, mutationCalls)
+	}
+}
+
+func TestWithRetryTxPreCallbackConnectionFailureTripsCircuit(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	breaker := newTestCircuitBreaker(t)
+	for range circuitFailureThreshold - 1 {
+		breaker.RecordFailure()
+	}
+	driver := &failureDriver{}
+	driver.failBegin.Store(1)
+	store := newFailureStore(driver)
+	store.breaker = breaker
+	defer func() { _ = store.db.Close() }()
+
+	var callbacks atomic.Int32
+	err := store.withRetryTx(t.Context(), func(*sql.Tx) error {
+		callbacks.Add(1)
+		return nil
+	})
+	if !errors.Is(err, testConnectionLoss) {
+		t.Fatalf("withRetryTx() error = %v, want connection cause %v", err, testConnectionLoss)
+	}
+	if got := breaker.State(); got != circuitOpen {
+		t.Fatalf("circuit state = %q, want %q", got, circuitOpen)
+	}
+	if got := driver.begins.Load(); got != 1 {
+		t.Fatalf("transaction begins = %d, want 1", got)
+	}
+	if got := callbacks.Load(); got != 0 {
+		t.Fatalf("callback calls = %d, want 0 after pre-callback circuit trip", got)
+	}
+}
+
+func TestWithRetryTxSuccessResetsCircuitFailures(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	breaker := newTestCircuitBreaker(t)
+	for range circuitFailureThreshold - 1 {
+		breaker.RecordFailure()
+	}
+	driver := &failureDriver{}
+	store := newFailureStore(driver)
+	store.breaker = breaker
+	defer func() { _ = store.db.Close() }()
+
+	if err := store.withRetryTx(t.Context(), func(*sql.Tx) error { return nil }); err != nil {
+		t.Fatalf("withRetryTx() error = %v, want nil", err)
+	}
+	breaker.RecordFailure()
+	if got := breaker.State(); got != circuitClosed {
+		t.Fatalf("circuit state after success and one failure = %q, want %q", got, circuitClosed)
+	}
 }
 
 func TestDoltAutocommitRollbackCommitIsRetried(t *testing.T) {

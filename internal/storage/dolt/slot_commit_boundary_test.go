@@ -257,12 +257,15 @@ func TestMetadataSlotWritesDoltCommitResponseLossIsIndeterminateAndNotReplayed(t
 func TestWispMetadataSlotWritesSQLCommitResponseLossIsIndeterminateAndNotReplayed(t *testing.T) {
 	for _, tc := range metadataSlotWriteCases() {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BEADS_TEST_MODE", "")
+			breaker := newTestCircuitBreaker(t)
 			driver := &slotCommitBoundaryDriver{
 				metadata:     tc.metadata,
 				activeWisp:   true,
 				sqlCommitErr: testConnectionLoss,
 			}
 			store := newSlotCommitBoundaryStore(driver)
+			store.breaker = breaker
 			t.Cleanup(func() { _ = store.db.Close() })
 
 			err := tc.run(store)
@@ -283,6 +286,11 @@ func TestWispMetadataSlotWritesSQLCommitResponseLossIsIndeterminateAndNotReplaye
 			}
 			if driver.txAttempts != 1 || driver.txCommits != 1 {
 				t.Fatalf("SQL transaction attempts = %d, commit calls = %d, want 1 and 1", driver.txAttempts, driver.txCommits)
+			}
+
+			state := breaker.readState()
+			if state.State != circuitClosed || state.Failures != 1 {
+				t.Fatalf("circuit state after one lost response = %+v, want closed with one failure", state)
 			}
 		})
 	}

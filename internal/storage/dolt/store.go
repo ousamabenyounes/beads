@@ -1032,6 +1032,14 @@ func (s *DoltStore) withReadTxLongTimeout(ctx context.Context, fn func(tx *sql.T
 }
 
 func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	// Keep circuit admission at the transaction retry boundary. Calling
+	// withRetry from here would multiply retries and could replay a write after
+	// an indeterminate commit.
+	if s.breaker != nil && !s.breaker.Allow() {
+		doltMetrics.circuitRejected.Add(ctx, 1)
+		return ErrCircuitOpen
+	}
+
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = 25 * time.Millisecond
 	bo.MaxElapsedTime = 5 * time.Second
@@ -1041,6 +1049,9 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	return backoff.Retry(func() error {
 		err := s.withWriteTx(ctx, fn)
 		if err == nil {
+			if s.breaker != nil {
+				s.breaker.RecordSuccess()
+			}
 			return nil
 		}
 		// Dolt's exact 1105 autocommit rollback proves the transaction did not
@@ -1069,6 +1080,13 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 		// ErrCommitIndeterminate sentinel above.
 		if isRetryableError(err) {
 			doltMetrics.writeRetries.Add(ctx, 1, metric.WithAttributes(attribute.String("type", "connection")))
+			if s.breaker != nil && isConnectionError(err) {
+				s.breaker.RecordFailure()
+				if s.breaker.State() == circuitOpen {
+					doltMetrics.circuitTrips.Add(ctx, 1)
+					return backoff.Permanent(fmt.Errorf("%w (circuit breaker tripped)", err))
+				}
+			}
 			return err // pre-commit transient: retryable
 		}
 		return backoff.Permanent(err)
@@ -1088,6 +1106,13 @@ func (s *DoltStore) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	}
 	if err := tx.Commit(); err != nil {
 		return wrapSQLCommitError("commit write tx", err)
+	}
+	return nil
+}
+
+func (s *DoltStore) commitSQLTx(ctx context.Context, op string, tx *sql.Tx) error {
+	if err := tx.Commit(); err != nil {
+		return s.recordDoltPublicationFailure(ctx, wrapSQLCommitError(op, err))
 	}
 	return nil
 }

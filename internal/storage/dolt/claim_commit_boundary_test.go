@@ -23,6 +23,7 @@ type claimCommitBoundaryDriver struct {
 
 	stageErr        error
 	commitErr       error
+	sqlCommitErr    error
 	nothingToCommit bool
 	checkedUpdate   bool
 	verifyAssignee  string
@@ -163,7 +164,7 @@ func (t *claimCommitBoundaryTx) Commit() error {
 	t.driver.mu.Lock()
 	defer t.driver.mu.Unlock()
 	t.driver.txCommits++
-	return nil
+	return t.driver.sqlCommitErr
 }
 
 func (t *claimCommitBoundaryTx) Rollback() error {

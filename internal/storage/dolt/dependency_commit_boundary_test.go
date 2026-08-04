@@ -118,11 +118,13 @@ func TestRemoveDependencySQLCommitResponseLossIsIndeterminateAndNotReplayed(t *t
 		{name: "wisp", activeWisp: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BEADS_TEST_MODE", "")
+			breaker := newTestCircuitBreaker(t)
 			driver := &dependencyCommitBoundaryDriver{
 				activeWisp: tc.activeWisp,
 				commitErr:  testConnectionLoss,
 			}
-			store := &DoltStore{db: sql.OpenDB(driver)}
+			store := &DoltStore{db: sql.OpenDB(driver), breaker: breaker}
 			t.Cleanup(func() { _ = store.db.Close() })
 
 			err := store.RemoveDependency(context.Background(), "dependency-source", "dependency-target", "alice")
@@ -140,6 +142,11 @@ func TestRemoveDependencySQLCommitResponseLossIsIndeterminateAndNotReplayed(t *t
 			}
 			if driver.txAttempts != 1 || driver.commitCalls != 1 {
 				t.Fatalf("transaction attempts = %d, commit calls = %d, want 1 and 1", driver.txAttempts, driver.commitCalls)
+			}
+
+			state := breaker.readState()
+			if state.State != circuitClosed || state.Failures != 1 {
+				t.Fatalf("circuit state after one lost response = %+v, want closed with one failure", state)
 			}
 		})
 	}
