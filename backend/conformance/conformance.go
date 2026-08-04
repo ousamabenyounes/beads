@@ -26,6 +26,7 @@ package conformance
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -208,6 +209,7 @@ func RunAll(t *testing.T, factory Factory) {
 
 	// Transaction
 	t.Run("Transaction", func(t *testing.T) { testTransaction(t, factory) })
+	t.Run("TransactionCallbackAtMostOnce", func(t *testing.T) { testTransactionCallbackAtMostOnce(t, factory) })
 	t.Run("TransactionSnapshotReads", func(t *testing.T) { testTransactionSnapshotReads(t, factory) })
 	t.Run("TransactionReadYourWrites", func(t *testing.T) { testTransactionReadYourWrites(t, factory) })
 }
@@ -945,6 +947,22 @@ func testTransaction(t *testing.T, f Factory) {
 	}
 	if !found {
 		t.Errorf("label 'from-tx' not found, got %v", labels)
+	}
+}
+
+func testTransactionCallbackAtMostOnce(t *testing.T, f Factory) {
+	s := f(t)
+	calls := 0
+
+	err := s.RunInTransaction(ctx(), "test: transient callback", func(storage.Transaction) error {
+		calls++
+		return driver.ErrBadConn
+	})
+	if !errors.Is(err, driver.ErrBadConn) {
+		t.Errorf("RunInTransaction error = %v, want original callback error %v", err, driver.ErrBadConn)
+	}
+	if calls != 1 {
+		t.Errorf("transaction callback calls = %d, want 1", calls)
 	}
 }
 

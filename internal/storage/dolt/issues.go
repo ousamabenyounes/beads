@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -400,73 +399,33 @@ func (s *DoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter
 // verifiedReadyClaim resolves a ready-claim write by verify-by-re-read
 // (bd-zccb9): the claimed ID is only known once the write body has run, so
 // this cannot ride verifiedClaimWrite's id parameter — but the resolution
-// protocol is the same. A replay after a verified rollback re-scans the ready
-// front and may legitimately claim a different issue. Split from
-// ClaimReadyIssue so injection tests can drive the write seam directly, the
-// same way the verifiedClaimWrite tests do.
+// protocol is the same. Split from ClaimReadyIssue so injection tests can
+// drive the write seam directly, the same way the verifiedClaimWrite tests do.
 //
-// The re-read is per-attempt and plane-aware (readReadyClaimState): the winner
-// may be an ephemeral row, and a replay may win a row in the other plane than
-// the first attempt selected.
+// Successful ready claims verify the winning plane because IncludeEphemeral
+// may select a wisp. An indeterminate commit response remains indeterminate:
+// assignee and status cannot prove the lease and actor-attributed event landed.
 func (s *DoltStore) verifiedReadyClaim(ctx context.Context, actor string, write func() (*types.Issue, error)) (*types.Issue, error) {
 	claimed, err := write()
-	if err != nil && !(errors.Is(err, errCommitPhase) && claimed != nil && s.serverMode) {
+	if err != nil {
 		return nil, err
 	}
 	if claimed == nil || !s.serverMode {
 		return claimed, err
 	}
-	for attempt := 0; ; attempt++ {
-		assignee, status, verr := s.readReadyClaimState(ctx, claimed.ID)
-		if verr != nil {
-			if err != nil {
-				return nil, err // the honest indeterminate error from withRetryTx
-			}
-			return nil, fmt.Errorf("ready claim of %s reported success but could not be verified (server degraded?): %w — re-read the issue before trusting the claim",
-				claimed.ID, verr)
-		}
-		post := claimedBy(actor)
-		if post.want(assignee, status) {
-			if err != nil {
-				doltMetrics.claimVerifyRecovered.Add(ctx, 1, metric.WithAttributes(
-					attribute.String("op", "ready-claim"), attribute.String("outcome", "applied")))
-			}
-			return claimed, nil
-		}
-		if err != nil && attempt < 1 {
-			// Verified rolled back: nothing landed, safe to replay once.
-			doltMetrics.claimVerifyRecovered.Add(ctx, 1, metric.WithAttributes(
-				attribute.String("op", "ready-claim"), attribute.String("outcome", "replayed")))
-			claimed, err = write()
-			// The replay carries the same commit-phase ambiguity as the first
-			// attempt: an errCommitPhase with a selection made must fall
-			// through to the verify pass — attempt is past the replay budget
-			// now, so a second verified rollback still exhausts with the
-			// honest "did not land" error — never surface the raw
-			// indeterminate error, which would reintroduce the wy-x543k
-			// false-failure and could orphan an applied claim on a DIFFERENT
-			// ready issue than the first attempt selected.
-			if err != nil && !(errors.Is(err, errCommitPhase) && claimed != nil) {
-				return nil, err
-			}
-			if claimed == nil {
-				if err != nil {
-					// Commit-phase loss before anything was selected: nothing
-					// to verify, honest indeterminate error.
-					return nil, err
-				}
-				return nil, nil
-			}
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("ready claim of %s did not land (connection lost during commit; rollback verified by re-read): %w", claimed.ID, err)
-		}
-		doltMetrics.claimVerifyLost.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("op", "ready-claim")))
-		return nil, fmt.Errorf("ready claim of %s reported success but did not land (found assignee=%q status=%q, want %s) — server likely degraded; treat the claim as NOT applied",
-			claimed.ID, assignee, status, post.desc)
+	assignee, status, verr := s.readReadyClaimState(ctx, claimed.ID)
+	if verr != nil {
+		return nil, fmt.Errorf("ready claim of %s reported success but could not be verified (server degraded?): %w — re-read the issue before trusting the claim",
+			claimed.ID, verr)
 	}
+	post := claimedBy(actor)
+	if post.want(assignee, status) {
+		return claimed, nil
+	}
+	doltMetrics.claimVerifyLost.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("op", "ready-claim")))
+	return nil, fmt.Errorf("ready claim of %s reported success but did not land (found assignee=%q status=%q, want %s) — server likely degraded; treat the claim as NOT applied",
+		claimed.ID, assignee, status, post.desc)
 }
 
 // HeartbeatIssue refreshes the lease on an issue actor holds in_progress,

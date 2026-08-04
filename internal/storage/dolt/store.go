@@ -670,6 +670,22 @@ func isRetryableError(err error) bool {
 	return false
 }
 
+// isSetupRetryableError extends the generic transient classifier with two
+// decoded Dolt setup races. Typed MySQL responses remain non-retryable during
+// normal operations; these responses are safe to retry only while a newly
+// created database and its schema are becoming available.
+func isSetupRetryableError(err error) bool {
+	if isRetryableError(err) {
+		return true
+	}
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1049 ||
+		(mysqlErr.Number == 1105 && strings.EqualFold(strings.TrimSpace(mysqlErr.Message), "no root value found in session"))
+}
+
 // isLockError returns true if the error indicates a Dolt lock contention problem.
 // These can occur when the Dolt server's storage layer is locked by another
 // process or a stale LOCK file was left behind by a crashed server.
@@ -1036,14 +1052,10 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 			doltMetrics.writeRetries.Add(ctx, 1, metric.WithAttributes(attribute.String("type", "serialization")))
 			return err // retryable
 		}
-		// Connection failures are only safe to replay BEFORE commit (BeginTx or
-		// the body): nothing was committed. A failure tagged errCommitPhase is
-		// ambiguous — the commit may have landed before the connection dropped —
-		// so replaying could double-apply the write. Surface it instead.
+		// Connection failures reaching this branch happened before commit;
+		// withWriteTx marks ambiguous commit response loss with the public
+		// ErrCommitIndeterminate sentinel above.
 		if isRetryableError(err) {
-			if errors.Is(err, errCommitPhase) {
-				return backoff.Permanent(fmt.Errorf("write commit result indeterminate after connection loss (not retried to avoid double-apply): %w", err))
-			}
 			doltMetrics.writeRetries.Add(ctx, 1, metric.WithAttributes(attribute.String("type", "connection")))
 			return err // pre-commit transient: retryable
 		}
@@ -2325,7 +2337,7 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, se
 	bo.MaxElapsedTime = 10 * time.Second
 	if err := backoff.Retry(func() error {
 		pingErr := db.PingContext(ctx)
-		if pingErr != nil && isRetryableError(pingErr) {
+		if pingErr != nil && isSetupRetryableError(pingErr) {
 			return pingErr // retryable — backoff will retry
 		}
 		if pingErr != nil {
@@ -2463,7 +2475,7 @@ func initSchemaOnDBWithRetryAndGateBootstrapHeal(
 	err := backoff.Retry(func() error {
 		if gate != nil {
 			if gateErr := gate(ctx, db); gateErr != nil {
-				if !schema.IsRemoteMigrateGateError(gateErr) && isRetryableError(gateErr) {
+				if !schema.IsRemoteMigrateGateError(gateErr) && isSetupRetryableError(gateErr) {
 					return gateErr
 				}
 				return backoff.Permanent(gateErr)
@@ -2471,7 +2483,7 @@ func initSchemaOnDBWithRetryAndGateBootstrapHeal(
 		}
 		var schemaErr error
 		applied, schemaErr = initSchemaOnDBWithBootstrapHeal(ctx, db, bootstrapHeal, endpoint)
-		if schemaErr != nil && isRetryableError(schemaErr) {
+		if schemaErr != nil && isSetupRetryableError(schemaErr) {
 			return schemaErr
 		}
 		if schemaErr != nil {

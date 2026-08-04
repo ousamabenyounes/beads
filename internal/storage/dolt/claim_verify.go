@@ -30,9 +30,9 @@ import (
 //
 //   - reported success        -> verify; a mismatch fails LOUDLY (the caller
 //     must know it does not hold the claim)
-//   - ambiguous commit loss   -> (errCommitPhase, surfaced by withRetryTx as
-//     indeterminate) verify; applied -> success, verified rolled back -> replay
-//     the write once (safe: nothing landed)
+//   - ambiguous commit loss   -> (ErrCommitIndeterminate, surfaced by
+//     withRetryTx) verify; applied -> success, every other outcome returns the
+//     original indeterminate error without replaying a mutation
 //   - any other error         -> honest failure (CAS lost, not-claimable, or
 //     pre-commit errors withRetryTx already retried); no verify needed
 //
@@ -176,9 +176,7 @@ func (s *DoltStore) readClaimStateIn(ctx context.Context, table, id string) (str
 }
 
 // verifiedClaimWrite runs write and resolves its outcome against the database
-// state per the protocol above. write must be safe to run twice when its first
-// run verifiably did not land (all claim-family writes are: they are CAS
-// updates, idempotent for the winning actor).
+// state per the protocol above.
 //
 // A verify that contradicts a reported success can in principle also be a
 // legitimate concurrent mutation (a forced unclaim landing within the
@@ -188,40 +186,30 @@ func (s *DoltStore) verifiedClaimWrite(ctx context.Context, id string, post clai
 	if !s.serverMode || s.isActiveWisp(ctx, id) {
 		return write()
 	}
-	const maxReplays = 1
-	for attempt := 0; ; attempt++ {
-		err := write()
-		if err != nil && !errors.Is(err, errCommitPhase) {
+	err := write()
+	if err != nil && !errors.Is(err, ErrCommitIndeterminate) {
+		return err
+	}
+	assignee, status, verr := s.readClaimState(ctx, id)
+	if verr != nil {
+		if err != nil {
 			return err
 		}
-		assignee, status, verr := s.readClaimState(ctx, id)
-		if verr != nil {
-			if err != nil {
-				return err // the honest indeterminate error from withRetryTx
-			}
-			return fmt.Errorf("%s of %s reported success but could not be verified (server degraded?): %w — re-read the issue before trusting the %s",
-				post.op, id, verr, post.op)
-		}
-		if post.want(assignee, status) {
-			if err != nil {
-				doltMetrics.claimVerifyRecovered.Add(ctx, 1, metric.WithAttributes(
-					attribute.String("op", post.op), attribute.String("outcome", "applied")))
-			}
-			return nil
-		}
-		if err != nil {
-			if attempt < maxReplays {
-				// Verified rolled back: nothing landed, so one replay is safe.
-				doltMetrics.claimVerifyRecovered.Add(ctx, 1, metric.WithAttributes(
-					attribute.String("op", post.op), attribute.String("outcome", "replayed")))
-				continue
-			}
-			return fmt.Errorf("%s of %s did not land (connection lost during commit; rollback verified by re-read): %w",
-				post.op, id, err)
-		}
-		doltMetrics.claimVerifyLost.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("op", post.op)))
-		return fmt.Errorf("%s of %s reported success but did not land (found assignee=%q status=%q, want %s) — server likely degraded; treat the %s as NOT applied",
-			post.op, id, assignee, status, post.desc, post.op)
+		return fmt.Errorf("%s of %s reported success but could not be verified (server degraded?): %w — re-read the issue before trusting the %s",
+			post.op, id, verr, post.op)
 	}
+	if post.want(assignee, status) {
+		if err != nil {
+			doltMetrics.claimVerifyRecovered.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("op", post.op), attribute.String("outcome", "applied")))
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	doltMetrics.claimVerifyLost.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("op", post.op)))
+	return fmt.Errorf("%s of %s reported success but did not land (found assignee=%q status=%q, want %s) — server likely degraded; treat the %s as NOT applied",
+		post.op, id, assignee, status, post.desc, post.op)
 }

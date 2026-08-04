@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
@@ -38,6 +40,134 @@ func TestRunInTransactionCallbackConnectionErrorIsNotReplayed(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("callback calls = %d, want 1", calls)
+	}
+}
+
+// TestRunInTransactionSerializationConflictInvokesCallbacksOnce orders two
+// independent handles so the stale transaction loses at commit. The public
+// callbacks must still each run once, and the winner's content must survive.
+func TestRunInTransactionSerializationConflictInvokesCallbacksOnce(t *testing.T) {
+	storeA, cleanupA := setupConcurrentTestStore(t)
+	defer cleanupA()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	storeB, err := New(ctx, &Config{
+		Path:           t.TempDir(),
+		CommitterName:  "test",
+		CommitterEmail: "test@example.com",
+		ServerHost:     "127.0.0.1",
+		ServerPort:     testServerPort,
+		Database:       storeA.database,
+		MaxOpenConns:   2,
+	})
+	if err != nil {
+		t.Fatalf("open second store for %s: %v", storeA.database, err)
+	}
+	defer storeB.Close()
+
+	issue := &types.Issue{
+		ID:          "test-tx-at-most-once",
+		Title:       "at-most-once transaction",
+		Description: "initial",
+		Status:      types.StatusOpen,
+		Priority:    2,
+		IssueType:   types.TypeTask,
+	}
+	if err := storeA.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	var callsA, callsB atomic.Int32
+	aPrepared := make(chan struct{})
+	bPrepared := make(chan struct{})
+	releaseA := make(chan struct{})
+	releaseB := make(chan struct{})
+	errA := make(chan error, 1)
+	errB := make(chan error, 1)
+
+	go func() {
+		errA <- storeA.RunInTransaction(ctx, "test: winner transaction", func(tx storage.Transaction) error {
+			callsA.Add(1)
+			if err := tx.UpdateIssue(ctx, issue.ID, map[string]interface{}{
+				"description": "winner",
+			}, "winner"); err != nil {
+				return err
+			}
+			close(aPrepared)
+			return waitForTransactionRelease(ctx, releaseA)
+		})
+	}()
+
+	go func() {
+		errB <- storeB.RunInTransaction(ctx, "test: stale transaction", func(tx storage.Transaction) error {
+			callsB.Add(1)
+			if err := tx.UpdateIssue(ctx, issue.ID, map[string]interface{}{
+				"description": "stale",
+			}, "stale"); err != nil {
+				return err
+			}
+			close(bPrepared)
+			return waitForTransactionRelease(ctx, releaseB)
+		})
+	}()
+
+	waitForTransactionPrepared(t, ctx, aPrepared, "winner")
+	waitForTransactionPrepared(t, ctx, bPrepared, "stale")
+	close(releaseA)
+	if err := <-errA; err != nil {
+		t.Fatalf("winner transaction: %v", err)
+	}
+	close(releaseB)
+	err = <-errB
+	if err == nil {
+		t.Fatal("stale transaction succeeded, want serialization conflict")
+	}
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) || (mysqlErr.Number != 1213 && mysqlErr.Number != 1205) {
+		t.Fatalf("stale transaction error = %v, want MySQL 1213 or 1205", err)
+	}
+	if errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("stale transaction error = %v unexpectedly marks an indeterminate commit", err)
+	}
+	if got := callsA.Load(); got != 1 {
+		t.Errorf("winner callback calls = %d, want 1", got)
+	}
+	if got := callsB.Load(); got != 1 {
+		t.Errorf("stale callback calls = %d, want 1", got)
+	}
+
+	freshDB, err := sql.Open("mysql", storeA.connStr)
+	if err != nil {
+		t.Fatalf("open fresh SQL handle: %v", err)
+	}
+	defer freshDB.Close()
+	var description string
+	if err := freshDB.QueryRowContext(ctx,
+		"SELECT description FROM issues WHERE id = ?", issue.ID).Scan(&description); err != nil {
+		t.Fatalf("read winner result from fresh SQL handle: %v", err)
+	}
+	if description != "winner" {
+		t.Errorf("fresh SQL description = %q, want winner", description)
+	}
+}
+
+func waitForTransactionPrepared(t *testing.T, ctx context.Context, prepared <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-prepared:
+	case <-ctx.Done():
+		t.Fatalf("%s transaction was not prepared: %v", name, ctx.Err())
+	}
+}
+
+func waitForTransactionRelease(ctx context.Context, release <-chan struct{}) error {
+	select {
+	case <-release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

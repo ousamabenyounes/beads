@@ -68,9 +68,18 @@ func (t *doltTransaction) CreateIssueImport(ctx context.Context, issue *types.Is
 // Wisp routing is handled by individual transaction methods based on
 // ID/Ephemeral.
 func (s *DoltStore) RunInTransaction(ctx context.Context, commitMsg string, fn func(tx storage.Transaction) error) error {
+	return s.runInTransaction(ctx, commitMsg, fn, s.runDoltTransaction)
+}
+
+func (s *DoltStore) runInTransaction(
+	ctx context.Context,
+	commitMsg string,
+	fn func(storage.Transaction) error,
+	run func(context.Context, string, func(storage.Transaction) error) error,
+) error {
 	return s.withRetry(ctx, func() error {
 		invoked := false
-		err := s.runDoltTransaction(ctx, commitMsg, func(tx storage.Transaction) error {
+		err := run(ctx, commitMsg, func(tx storage.Transaction) error {
 			invoked = true
 			return fn(tx)
 		})

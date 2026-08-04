@@ -227,8 +227,9 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 		return
 	}
 
+	committed := false
 	defer func() {
-		err = errors.Join(err, cleanup())
+		err = joinTransactionCleanupError(err, cleanup(), committed)
 	}()
 
 	var tx *sql.Tx
@@ -252,7 +253,15 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 		err = fmt.Errorf("embeddeddolt: commit tx: %w", cErr)
 		return
 	}
+	committed = true
 	return
+}
+
+func joinTransactionCleanupError(operationErr, cleanupErr error, committed bool) error {
+	if committed && cleanupErr != nil {
+		cleanupErr = wrapCommitIndeterminate("embeddeddolt: cleanup after SQL commit", cleanupErr)
+	}
+	return errors.Join(operationErr, cleanupErr)
 }
 
 func (s *EmbeddedDoltStore) ApplySchemaMigrations(ctx context.Context) (int, error) {
