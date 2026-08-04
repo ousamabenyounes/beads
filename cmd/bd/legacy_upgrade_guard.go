@@ -12,6 +12,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
 	"github.com/steveyegge/beads/internal/utils"
 )
 
@@ -26,7 +27,7 @@ func guardLegacyUpgradeWorkspace(beadsDir string) error {
 	}
 	cfg, err := configfile.LoadForDiscovery(beadsDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("loading config: %w", err)
 	}
 	if isHistoricalSQLiteWorkspace(beadsDir, cfg) {
 		return legacyUpgradeRefusal("historical SQLite workspace")
@@ -37,7 +38,7 @@ func guardLegacyUpgradeWorkspace(beadsDir string) error {
 	if err := validateConfiguredBackend(cfg); err != nil {
 		return err
 	}
-	if hasCurrentEmbeddedDoltRoot(beadsDir) {
+	if embeddeddolt.HasRepository(beadsDir) {
 		return nil
 	}
 	version, ok := legacyUpgradeVersionWitness(beadsDir)
@@ -66,7 +67,7 @@ func isHistoricalSQLiteWorkspace(beadsDir string, cfg *configfile.Config) bool {
 	if beadsDir == "" {
 		return false
 	}
-	if hasCurrentEmbeddedDoltRoot(beadsDir) {
+	if embeddeddolt.HasRepository(beadsDir) {
 		return false
 	}
 	if cfg != nil {
@@ -191,30 +192,6 @@ func guardUndiscoveredLegacyWorkspace() error {
 		}
 		dir = parent
 	}
-}
-
-func hasCurrentEmbeddedDoltRoot(beadsDir string) bool {
-	root := filepath.Join(beadsDir, "embeddeddolt")
-	info, err := os.Lstat(root)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return false
-	}
-	databases, err := os.ReadDir(root)
-	if err != nil {
-		return false
-	}
-	// A failed or interrupted open may leave the root behind. Require the
-	// coarse repository marker one level below it; never inspect Dolt files.
-	for _, database := range databases {
-		if !database.IsDir() || database.Type()&os.ModeSymlink != 0 {
-			continue
-		}
-		marker, err := os.Lstat(filepath.Join(root, database.Name(), ".dolt"))
-		if err == nil && marker.IsDir() && marker.Mode()&os.ModeSymlink == 0 {
-			return true
-		}
-	}
-	return false
 }
 
 func hasLegacyDoltRoot(beadsDir string) bool {

@@ -842,6 +842,30 @@ func restoreChangeDirSelection() {
 	changeDirEnvSnapshot = nil
 }
 
+func guardLegacyNoStoreCommand(cmd *cobra.Command, beadsDir string) error {
+	if cmd == nil || !cmd.Runnable() || cmd.Parent() == nil || cmd == versionCmd ||
+		cmd == doctorCmd || cmd == initCmd || cmd == bootstrapCmd ||
+		cmd == legacySQLiteCmd {
+		return nil
+	}
+	if cmd == schemaCmd && cmd.Parent() != nil && cmd.Parent().Parent() == nil {
+		return nil
+	}
+	for current := cmd; current != nil; current = current.Parent() {
+		if current == metricsCmd {
+			return nil
+		}
+	}
+	switch cmd.Name() {
+	case "__complete", "__completeNoDesc", "bash", "completion", "fish", "help", "powershell", "zsh":
+		return nil
+	}
+	if beadsDir == "" {
+		return guardUndiscoveredLegacyWorkspace()
+	}
+	return guardLegacyUpgradeWorkspace(beadsDir)
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "bd",
 	Short: "bd - Dependency-aware issue tracker",
@@ -1119,9 +1143,10 @@ var rootCmd = &cobra.Command{
 		// Rebind them to the selected workspace so explicit --db / BEADS_DB
 		// targets behave consistently across doctor/bootstrap/context/dolt.
 		if skipsStoreInit {
-			prepareSelectedNoDBContext(selectedNoDBBeadsDir(cmd))
+			beadsDir := selectedNoDBBeadsDir(cmd)
+			prepareSelectedNoDBContext(beadsDir)
 			refreshBoundCommandConfig(cmd)
-			if beadsDir := os.Getenv("BEADS_DIR"); beadsDir == "" {
+			if os.Getenv("BEADS_DIR") == "" {
 				loadEnvironment()
 				if err := loadServerModeFromConfig(); err != nil {
 					// Warn, don't fatal: skipsStoreInit commands (doctor,
@@ -1130,6 +1155,12 @@ var rootCmd = &cobra.Command{
 					// corruption being reported.
 					fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 				}
+			}
+			if beadsDir == "" {
+				beadsDir = beads.FindBeadsDir()
+			}
+			if err := guardLegacyNoStoreCommand(cmd, beadsDir); err != nil {
+				return HandleError("%v", err)
 			}
 			if _, err := getDoltAutoCommitMode(); err != nil {
 				return HandleError("%v", err)

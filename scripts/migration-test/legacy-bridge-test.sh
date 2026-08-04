@@ -10,6 +10,8 @@ trap 'rm -rf -- "$tmp"' EXIT
 
 old="$tmp/old-bd"
 new="$tmp/new-bd"
+old_generic_export_marker="$tmp/old-generic-export"
+new_legacy_sqlite_reader_marker="$tmp/new-legacy-sqlite-reader"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
@@ -18,13 +20,31 @@ printf '%s\n' \
   '  [ "$arg" != version ] || { printf "%s\\n" "bd version 0.49.6"; exit 0; }' \
   'done' \
   'for arg in "$@"; do' \
-  '  [ "$arg" != export ] || { printf "%s\\n" "{\"id\":\"historical-1\",\"title\":\"Historical issue\",\"created_at\":\"2020-01-01T00:00:00.600000000Z\"}"; exit 0; }' \
+  '  [ "$arg" != export ] || { : > "'"$old_generic_export_marker"'"; exit 91; }' \
   'done' \
   'exit 2' >"$old"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
   'case "$1" in' \
+  '  migrate)' \
+  '    test "$2" = legacy-sqlite' \
+  '    source_db=""' \
+  '    output=""' \
+  '    shift 2' \
+  '    while (($#)); do' \
+  '      case "$1" in' \
+  '        --source-db) source_db="$2"; shift 2 ;;' \
+  '        --output) output="$2"; shift 2 ;;' \
+  '        *) exit 2 ;;' \
+  '      esac' \
+  '    done' \
+  '    case "$source_db" in /*/sealed-source/.beads/beads.db) ;; *) exit 2 ;; esac' \
+  '    test "$source_db" != "$PWD/.beads/beads.db"' \
+  '    test -n "$output"' \
+  '    printf "%s\\n" "{\"id\":\"historical-1\",\"title\":\"Historical issue\",\"created_at\":\"2020-01-01T00:00:00.600000000Z\"}" > "$output"' \
+  "    : > \"$new_legacy_sqlite_reader_marker\"" \
+  '    ;;' \
   '  init)' \
   '    test -s .beads/issues.jsonl' \
   '    mkdir -p .beads/embeddeddolt/hist' \
@@ -39,6 +59,9 @@ printf '%s\n' \
   '  *) exit 2 ;;' \
   'esac' >"$new"
 chmod +x "$old" "$new"
+old_v0503="$tmp/old-v0503-bd"
+sed 's/bd version 0.49.6/bd version 0.50.3/' "$old" >"$old_v0503"
+chmod +x "$old_v0503"
 
 # The release-binary version probe must not run an untrusted historical binary
 # in the caller's workspace or with its HOME/Git/runtime environment.
@@ -96,6 +119,8 @@ fingerprint() {
 
 run_lane() {
   local name=$1
+  local source_version=$2
+  local source_binary=$3
   local source="$tmp/$name-source"
   local destination="$tmp/$name-destination"
   mkdir -p "$source/.beads"
@@ -111,8 +136,8 @@ run_lane() {
   esac
   local before
   before=$(fingerprint "$source/.beads")
-  "$BRIDGE" --source "$source" --destination "$destination" --source-version v0.49.6 \
-    --old-bd "$old" --new-bd "$new" --prefix hist
+  "$BRIDGE" --source "$source" --destination "$destination" --source-version "$source_version" \
+    --old-bd "$source_binary" --new-bd "$new" --prefix hist
   [ "$(fingerprint "$source/.beads")" = "$before" ] || {
     printf '%s bridge mutated source\n' "$name" >&2
     exit 1
@@ -126,9 +151,17 @@ run_lane() {
   test ! -e "$destination/cutover/.beads/dolt"
 }
 
-run_lane sqlite
-run_lane sqlite-implicit
-run_lane sqlite-absent
+run_lane sqlite v0.49.6 "$old"
+run_lane sqlite-implicit v0.49.6 "$old"
+run_lane sqlite-absent v0.50.3 "$old_v0503"
+test ! -e "$old_generic_export_marker" || {
+  printf 'direct bridge invoked the historical generic export\n' >&2
+  exit 1
+}
+test -e "$new_legacy_sqlite_reader_marker" || {
+  printf 'direct bridge did not invoke the candidate legacy SQLite reader\n' >&2
+  exit 1
+}
 
 probe_mutator="$tmp/probe-mutator-bd"
 printf '%s\n' \
@@ -249,26 +282,39 @@ if "$BRIDGE" --source "$source" --destination "$tmp/source-alias/nested-cutover"
 fi
 test ! -e "$source/nested-cutover"
 
-bad_old="$tmp/bad-old-bd"
+bad_new="$tmp/bad-new-bd"
+candidate_was_invoked="$tmp/candidate-was-invoked"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
-  'for arg in "$@"; do' \
-  '  [ "$arg" != version ] || { printf "%s\\n" "bd version 0.49.6"; exit 0; }' \
-  'done' \
-  'for arg in "$@"; do' \
-  '  [ "$arg" != export ] || { printf "%s\\n" "{\"title\":\"missing id\"}" "{\"id\":\"historical-1\",\"title\":\"Historical issue\"}"; exit 0; }' \
-  'done' \
-  'exit 2' >"$bad_old"
-chmod +x "$bad_old"
-marker="$tmp/candidate-was-invoked"
-if BRIDGE_TEST_MARKER="$marker" "$BRIDGE" --source "$source" \
-    --destination "$tmp/invalid-jsonl-destination" --source-version v0.49.6 --old-bd "$bad_old" \
-    --new-bd "$new" --prefix hist >/dev/null 2>&1; then
+  'case "$1" in' \
+  '  migrate)' \
+  '    test "$2" = legacy-sqlite' \
+  '    output=""' \
+  '    shift 2' \
+  '    while (($#)); do' \
+  '      case "$1" in' \
+  '        --source-db) shift 2 ;;' \
+  '        --output) output="$2"; shift 2 ;;' \
+  '        *) exit 2 ;;' \
+  '      esac' \
+  '    done' \
+  '    printf "%s\\n" "{\"title\":\"missing id\"}" "{\"id\":\"historical-1\",\"title\":\"Historical issue\"}" > "$output"' \
+  '    ;;' \
+  '  init)' \
+  "    : > \"$candidate_was_invoked\"" \
+  '    exit 2' \
+  '    ;;' \
+  '  *) exit 2 ;;' \
+  'esac' >"$bad_new"
+chmod +x "$bad_new"
+if "$BRIDGE" --source "$source" \
+    --destination "$tmp/invalid-jsonl-destination" --source-version v0.49.6 --old-bd "$old" \
+    --new-bd "$bad_new" --prefix hist >/dev/null 2>&1; then
   printf 'bridge accepted an invalid JSONL record\n' >&2
   exit 1
 fi
-test ! -e "$marker" || {
+test ! -e "$candidate_was_invoked" || {
   printf 'bridge invoked the candidate before validating every JSONL record\n' >&2
   exit 1
 }
@@ -280,6 +326,19 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
   'case "$1" in' \
+  '  migrate)' \
+  '    test "$2" = legacy-sqlite' \
+  '    output=""' \
+  '    shift 2' \
+  '    while (($#)); do' \
+  '      case "$1" in' \
+  '        --source-db) shift 2 ;;' \
+  '        --output) output="$2"; shift 2 ;;' \
+  '        *) exit 2 ;;' \
+  '      esac' \
+  '    done' \
+  '    printf "%s\\n" "{\"id\":\"historical-1\",\"title\":\"Historical issue\",\"created_at\":\"2020-01-01T00:00:00.600000000Z\"}" > "$output"' \
+  '    ;;' \
   '  init)' \
   "    : > \"$candidate_init_marker\"" \
   '    test -s .beads/issues.jsonl' \

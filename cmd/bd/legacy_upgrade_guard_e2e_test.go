@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/spf13/cobra"
 )
 
 func TestLegacyUpgradeGuardRefusesBeforeMutatingHistoricalWorkspace(t *testing.T) {
@@ -74,6 +78,8 @@ func TestLegacyUpgradeGuardRefusesBeforeMutatingHistoricalWorkspace(t *testing.T
 		wantJSON bool
 	}{
 		{name: "list", args: []string{"list", "--json", "--limit", "0", "--all"}},
+		{name: "context", args: []string{"context", "--json"}},
+		{name: "dolt start", args: []string{"dolt", "start"}},
 		{name: "force init", args: []string{"init", "--force", "--quiet", "--non-interactive", "--skip-hooks", "--skip-agents"}},
 		{name: "doctor", args: []string{"doctor", "--json"}, wantOK: true, wantJSON: true},
 	}
@@ -91,14 +97,20 @@ func TestLegacyUpgradeGuardRefusesBeforeMutatingHistoricalWorkspace(t *testing.T
 			for _, tc := range commands {
 				t.Run(tc.name, func(t *testing.T) {
 					before := legacyUpgradeTreeDigest(t, beadsDir)
-					cmd := exec.Command(bd, tc.args...)
+					commandCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					cmd := exec.CommandContext(commandCtx, bd, tc.args...)
 					cmd.Dir = repoDir
 					cmd.Env = append(os.Environ(), "BD_DISABLE_METRICS=1", "BEADS_DOLT_AUTO_START=0")
 					var stdout, stderr bytes.Buffer
 					cmd.Stdout = &stdout
 					cmd.Stderr = &stderr
 					err := cmd.Run()
+					commandContextErr := commandCtx.Err()
+					cancel()
 					output := stdout.String() + stderr.String()
+					if commandContextErr != nil {
+						t.Fatalf("bd %s did not refuse before the command deadline: %v\n%s", strings.Join(tc.args, " "), commandContextErr, output)
+					}
 					if (err == nil) != tc.wantOK {
 						t.Fatalf("bd %s error = %v, want success=%v\n%s", strings.Join(tc.args, " "), err, tc.wantOK, output)
 					}
@@ -127,6 +139,69 @@ func TestLegacyUpgradeGuardRefusesBeforeMutatingHistoricalWorkspace(t *testing.T
 				})
 			}
 		})
+	}
+}
+
+func TestLegacyNoStoreCommandExemptions(t *testing.T) {
+	syntheticRoot := &cobra.Command{Use: "bd"}
+	helpCmd := &cobra.Command{Use: "help", Run: func(*cobra.Command, []string) {}}
+	completeCmd := &cobra.Command{Use: "__complete", Run: func(*cobra.Command, []string) {}}
+	syntheticRoot.AddCommand(helpCmd, completeCmd)
+	tests := []struct {
+		name string
+		cmd  *cobra.Command
+	}{
+		{name: "root", cmd: rootCmd},
+		{name: "version", cmd: versionCmd},
+		{name: "schema", cmd: schemaCmd},
+		{name: "metrics", cmd: metricsCmd},
+		{name: "metrics subcommand", cmd: metricsOffCmd},
+		{name: "doctor", cmd: doctorCmd},
+		{name: "init", cmd: initCmd},
+		{name: "bootstrap", cmd: bootstrapCmd},
+		{name: "legacy SQLite reader", cmd: legacySQLiteCmd},
+		{name: "help", cmd: helpCmd},
+		{name: "shell completion", cmd: completeCmd},
+		{name: "non-runnable", cmd: &cobra.Command{Use: "group"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := guardLegacyNoStoreCommand(tt.cmd, t.TempDir()); err != nil {
+				t.Fatalf("guardLegacyNoStoreCommand() = %v, want exemption", err)
+			}
+		})
+	}
+
+	beadsDir := t.TempDir()
+	writeFile(t, filepath.Join(beadsDir, "vc.db"), []byte("SQLite format 3\x00"))
+	if err := guardLegacyNoStoreCommand(contextCmd, beadsDir); !isLegacyUpgradeRefusal(err) {
+		t.Fatalf("context admission = %v, want legacy migration refusal", err)
+	}
+}
+
+func TestVersionLeavesHistoricalWorkspaceUnchanged(t *testing.T) {
+	bd := buildBDUnderTest(t)
+	repoDir := t.TempDir()
+	initGitRepo(t, repoDir)
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(beadsDir, "vc.db"), []byte("SQLite format 3\x00"))
+	before := legacyUpgradeTreeDigest(t, beadsDir)
+
+	cmd := exec.Command(bd, "version")
+	cmd.Dir = repoDir
+	cmd.Env = append(os.Environ(), "BD_DISABLE_METRICS=1", "BEADS_DOLT_AUTO_START=0")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("bd version failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "bd version") {
+		t.Fatalf("bd version output missing version: %s", output)
+	}
+	if after := legacyUpgradeTreeDigest(t, beadsDir); after != before {
+		t.Fatalf("bd version mutated historical source: before=%s after=%s", before, after)
 	}
 }
 

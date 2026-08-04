@@ -349,8 +349,10 @@ case "$strategy" in
             --no-daemon --no-auto-import export --format jsonl > "$export_jsonl"
         ;;
     direct)
-        run_at "$destination/sealed-source" "$old_bd" \
-            --no-daemon --no-auto-import export --format jsonl > "$export_jsonl"
+        run_at "$destination/probe" "$new_bd" \
+            migrate legacy-sqlite \
+            --source-db "$destination/sealed-source/.beads/$sqlite_database_name" \
+            --output "$export_jsonl"
         ;;
 esac
 

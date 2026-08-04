@@ -118,6 +118,9 @@ func TestLegacyUpgradeGuardMetadataLessSQLiteAndCurrentEmbeddedPrecedence(t *tes
 		if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt", "beads", ".dolt"), 0o700); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "embeddeddolt", "beads", ".dolt", "repo-entry"), []byte("opaque"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.Mkdir(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
 			t.Fatal(err)
 		}
