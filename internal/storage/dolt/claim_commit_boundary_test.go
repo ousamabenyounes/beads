@@ -28,6 +28,7 @@ type claimCommitBoundaryDriver struct {
 	checkedUpdate   bool
 	verifyAssignee  string
 	verifyStatus    types.Status
+	activeWisp      bool
 
 	claimMutations  int
 	claimedIDs      []string
@@ -84,6 +85,9 @@ func (c *claimCommitBoundaryConn) QueryContext(_ context.Context, query string, 
 
 	switch {
 	case strings.Contains(query, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1"):
+		if c.driver.activeWisp {
+			return &claimCommitBoundaryRows{columns: []string{"exists"}, values: [][]driver.Value{{int64(1)}}}, nil
+		}
 		return &claimCommitBoundaryRows{columns: []string{"exists"}}, nil
 	case strings.Contains(query, "SELECT assignee, status FROM issues WHERE id = ?"):
 		c.driver.claimStateReads++

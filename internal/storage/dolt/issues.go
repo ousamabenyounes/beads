@@ -192,6 +192,12 @@ func checkExpectedVersionInTx(ctx context.Context, tx *sql.Tx, id string, expect
 // Delegates SQL work to issueops.UpdateIssueInTx; handles Dolt-specific concerns
 // (metadata validation, DemoteToWisp, DOLT_ADD/COMMIT, cache invalidation).
 func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.updateIssue(ctx, id, updates, actor)
+	})
+}
+
+func (s *DoltStore) updateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
 	// Validate metadata against schema before wisp routing (GH#1416 Phase 2).
 	if err := validateUpdateMetadata(updates); err != nil {
 		return err
@@ -243,6 +249,12 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 // validation, wisp routing, DemoteToWisp, DOLT_ADD/COMMIT); UpdateIssue is the
 // hot path and is left untouched.
 func (s *DoltStore) UpdateIssueChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, opts storage.UpdateIssueOptions) error {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.updateIssueChecked(ctx, id, updates, actor, opts)
+	})
+}
+
+func (s *DoltStore) updateIssueChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, opts storage.UpdateIssueOptions) error {
 	// Validate metadata against schema before wisp routing (GH#1416 Phase 2).
 	if err := validateUpdateMetadata(updates); err != nil {
 		return err
@@ -321,6 +333,12 @@ func (s *DoltStore) UpdateIssueChecked(ctx context.Context, id string, updates m
 // Delegates SQL work to issueops.ClaimIssueInTx; handles Dolt-specific concerns
 // (wisp routing, DOLT_ADD/COMMIT, cache invalidation).
 func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) error {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.claimIssue(ctx, id, actor)
+	})
+}
+
+func (s *DoltStore) claimIssue(ctx context.Context, id string, actor string) error {
 	// Route ephemeral IDs to wisps table (falls through for promoted wisps).
 	// Wisps skip DOLT_COMMIT since they live in dolt_ignored tables.
 	if s.isActiveWisp(ctx, id) {
@@ -529,6 +547,12 @@ func (s *DoltStore) UpdateIssueType(ctx context.Context, id string, issueType st
 // Delegates SQL work to issueops.CloseIssueInTx; handles Dolt-specific concerns
 // (wisp routing, DOLT_ADD/COMMIT, cache invalidation).
 func (s *DoltStore) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.closeIssue(ctx, id, reason, actor, session)
+	})
+}
+
+func (s *DoltStore) closeIssue(ctx context.Context, id string, reason string, actor string, session string) error {
 	// Route ephemeral IDs to wisps table (falls through for promoted wisps).
 	// Wisps skip DOLT_COMMIT since they live in dolt_ignored tables.
 	if s.isActiveWisp(ctx, id) {
@@ -559,6 +583,16 @@ func (s *DoltStore) CloseIssue(ctx context.Context, id string, reason string, ac
 // atomic (no TOCTOU). Mirrors CloseIssue's Dolt-specific concerns (wisp routing,
 // DOLT_ADD/COMMIT).
 func (s *DoltStore) CloseIssueChecked(ctx context.Context, id string, actor string, opts storage.CloseIssueOptions) (storage.CloseIssueResult, error) {
+	var result storage.CloseIssueResult
+	err := s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		var err error
+		result, err = s.closeIssueChecked(ctx, id, actor, opts)
+		return err
+	})
+	return result, err
+}
+
+func (s *DoltStore) closeIssueChecked(ctx context.Context, id string, actor string, opts storage.CloseIssueOptions) (storage.CloseIssueResult, error) {
 	// Route ephemeral IDs to wisps table (falls through for promoted wisps).
 	// Wisps skip DOLT_COMMIT since they live in dolt_ignored tables.
 	if s.isActiveWisp(ctx, id) {
@@ -589,6 +623,12 @@ func (s *DoltStore) CloseIssueChecked(ctx context.Context, id string, actor stri
 
 // DeleteIssue permanently removes an issue
 func (s *DoltStore) DeleteIssue(ctx context.Context, id string) error {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.deleteIssue(ctx, id)
+	})
+}
+
+func (s *DoltStore) deleteIssue(ctx context.Context, id string) error {
 	// Route ephemeral IDs to wisps table (falls through for promoted wisps)
 	if s.isActiveWisp(ctx, id) {
 		return s.deleteWisp(ctx, id)
@@ -604,7 +644,7 @@ func (s *DoltStore) DeleteIssue(ctx context.Context, id string) error {
 			[]string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"},
 			commitMsg)
 	}); err != nil {
-		return err
+		return s.recordDoltPublicationFailure(ctx, err)
 	}
 	return nil
 }
@@ -629,6 +669,16 @@ const maxRecursiveResults = 10000
 const queryBatchSize = 200
 
 func (s *DoltStore) DeleteIssues(ctx context.Context, ids []string, cascade bool, force bool, dryRun bool) (*types.DeleteIssuesResult, error) {
+	var result *types.DeleteIssuesResult
+	err := s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		var err error
+		result, err = s.deleteIssues(ctx, ids, cascade, force, dryRun)
+		return err
+	})
+	return result, err
+}
+
+func (s *DoltStore) deleteIssues(ctx context.Context, ids []string, cascade bool, force bool, dryRun bool) (*types.DeleteIssuesResult, error) {
 	if len(ids) == 0 {
 		return &types.DeleteIssuesResult{}, nil
 	}
@@ -680,7 +730,7 @@ func (s *DoltStore) DeleteIssues(ctx context.Context, ids []string, cascade bool
 		if result != nil {
 			result.DeletedCount += wispDeleteCount
 		}
-		return result, err
+		return result, s.recordDoltPublicationFailure(ctx, err)
 	}
 	result.DeletedCount += wispDeleteCount
 

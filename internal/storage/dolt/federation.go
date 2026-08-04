@@ -59,6 +59,16 @@ func (s *DoltStore) pushRefToPeer(ctx context.Context, peer string, refspec stri
 // For git-protocol remotes, uses CLI `dolt pull` to avoid MySQL connection timeouts.
 // Returns any merge conflicts if present.
 func (s *DoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Conflict, error) {
+	var conflicts []storage.Conflict
+	err := s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		var err error
+		conflicts, err = s.pullFromPeer(ctx, peer)
+		return err
+	})
+	return conflicts, err
+}
+
+func (s *DoltStore) pullFromPeer(ctx context.Context, peer string) ([]storage.Conflict, error) {
 	// GH#2474: Auto-commit pending changes before pull to prevent
 	// "cannot merge with uncommitted changes" errors.
 	if !s.readOnly {

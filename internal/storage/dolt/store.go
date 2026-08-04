@@ -3733,6 +3733,12 @@ func (s *DoltStore) PullRemote(ctx context.Context, remote string) error {
 // pullFromRemote is the internal implementation for all pull operations.
 // It routes through CLI or SQL based on the remote's protocol and credentials.
 func (s *DoltStore) pullFromRemote(ctx context.Context, remote string) (retErr error) {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.pullFromRemoteUnchecked(ctx, remote)
+	})
+}
+
+func (s *DoltStore) pullFromRemoteUnchecked(ctx context.Context, remote string) (retErr error) {
 	ctx, span := doltTracer.Start(ctx, "dolt.pull",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(append(s.doltSpanAttrs(),

@@ -196,7 +196,7 @@ func (s *DoltStore) updateWisp(ctx context.Context, id string, updates map[strin
 		return err
 	}
 
-	return wrapSQLCommitError("commit update wisp", tx.Commit())
+	return s.commitSQLTx(ctx, "commit update wisp", tx)
 }
 
 // updateWispChecked updates a wisp with the optional atomic preconditions of
@@ -228,7 +228,7 @@ func (s *DoltStore) updateWispChecked(ctx context.Context, id string, updates ma
 		return err
 	}
 
-	return wrapSQLCommitError("commit update wisp", tx.Commit())
+	return s.commitSQLTx(ctx, "commit update wisp", tx)
 }
 
 // closeWisp closes a wisp in the wisps table.
@@ -245,7 +245,7 @@ func (s *DoltStore) closeWisp(ctx context.Context, id string, reason string, act
 		return err
 	}
 
-	return wrapSQLCommitError("commit close wisp", tx.Commit())
+	return s.commitSQLTx(ctx, "commit close wisp", tx)
 }
 
 // closeWispChecked closes a wisp with the is_blocked guard, mirroring closeWisp
@@ -276,7 +276,7 @@ func (s *DoltStore) closeWispChecked(ctx context.Context, id string, actor strin
 		return storage.CloseIssueResult{}, err
 	}
 
-	if err := wrapSQLCommitError("commit close wisp", tx.Commit()); err != nil {
+	if err := s.commitSQLTx(ctx, "commit close wisp", tx); err != nil {
 		return storage.CloseIssueResult{}, err
 	}
 	return storage.CloseIssueResult{Unchanged: res.AlreadyClosed, OpenChildren: res.OpenChildren}, nil
@@ -316,7 +316,7 @@ func (s *DoltStore) deleteWisp(ctx context.Context, id string) error {
 		return fmt.Errorf("recompute is_blocked after wisp delete for %s: %w", id, err)
 	}
 
-	return wrapSQLCommitError("commit delete wisp", tx.Commit())
+	return s.commitSQLTx(ctx, "commit delete wisp", tx)
 }
 
 // deleteWispBatch permanently removes multiple wisps using one transaction per
@@ -387,8 +387,8 @@ func (s *DoltStore) deleteWispBatchTx(ctx context.Context, ids []string) (int, e
 		return 0, fmt.Errorf("recompute is_blocked after batched wisp delete: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return 0, wrapSQLCommitError("commit batch wisp delete", err)
+	if err := s.commitSQLTx(ctx, "commit batch wisp delete", tx); err != nil {
+		return 0, err
 	}
 
 	return int(rowsAffected), nil
@@ -408,7 +408,7 @@ func (s *DoltStore) claimWisp(ctx context.Context, id string, actor string) erro
 		return err
 	}
 
-	return wrapSQLCommitError("commit claim wisp", tx.Commit())
+	return s.commitSQLTx(ctx, "commit claim wisp", tx)
 }
 
 // ListWisps returns ephemeral issues matching the filter.
