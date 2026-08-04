@@ -15,7 +15,6 @@ import (
 	"github.com/steveyegge/beads/internal/idgen"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
-	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -216,15 +215,8 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 			return nil
 		}
 
-		for _, table := range []string{"issues", "events"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
 		commitMsg := fmt.Sprintf("bd: update %s", id)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
+		return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
 	})
 }
 
@@ -294,15 +286,8 @@ func (s *DoltStore) UpdateIssueChecked(ctx context.Context, id string, updates m
 				return nil
 			}
 
-			for _, table := range []string{"issues", "events"} {
-				_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-			}
 			commitMsg := fmt.Sprintf("bd: update %s", id)
-			if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-				return fmt.Errorf("dolt commit: %w", err)
-			}
-			return nil
+			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
 		})
 	}
 
@@ -345,17 +330,8 @@ func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) err
 				return err
 			}
 
-			// Dolt versioning for permanent issues.
-			// GH#2455: Stage only the tables we modified, then commit without -A.
-			for _, table := range []string{"issues", "events"} {
-				_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-			}
 			commitMsg := fmt.Sprintf("bd: claim %s", id)
-			if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-				return fmt.Errorf("dolt commit: %w", err)
-			}
-			return nil
+			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
 		})
 	})
 }
@@ -381,15 +357,8 @@ func (s *DoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter
 				return nil
 			}
 
-			for _, table := range []string{"issues", "events"} {
-				_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-			}
 			commitMsg := fmt.Sprintf("bd: claim ready %s", claimed.ID)
-			if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-				return fmt.Errorf("dolt commit: %w", err)
-			}
-			return nil
+			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
 		})
 		return claimed, err
 	}
@@ -462,15 +431,8 @@ func (s *DoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan time.Dur
 		if len(reclaimed) == 0 {
 			return nil
 		}
-		for _, table := range []string{"issues", "events"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
 		commitMsg := fmt.Sprintf("bd: reclaim %d expired lease(s)", len(reclaimed))
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
+		return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
 	})
 	if err != nil {
 		return nil, err
@@ -496,16 +458,8 @@ func (s *DoltStore) UnclaimIssue(ctx context.Context, id string, actor string, f
 				return err
 			}
 
-			// Dolt versioning for permanent issues.
-			for _, table := range []string{"issues", "events"} {
-				_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-			}
 			commitMsg := fmt.Sprintf("bd: unclaim %s", id)
-			if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-				return fmt.Errorf("dolt commit: %w", err)
-			}
-			return nil
+			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
 		})
 	})
 }
@@ -525,16 +479,8 @@ func (s *DoltStore) UnclaimIssueIfAssignee(ctx context.Context, id string, actor
 				return err
 			}
 
-			// Dolt versioning for permanent issues.
-			for _, table := range []string{"issues", "events"} {
-				_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-			}
 			commitMsg := fmt.Sprintf("bd: unclaim %s", id)
-			if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-				return fmt.Errorf("dolt commit: %w", err)
-			}
-			return nil
+			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
 		})
 	})
 }
@@ -588,17 +534,8 @@ func (s *DoltStore) CloseIssue(ctx context.Context, id string, reason string, ac
 			return err
 		}
 
-		// Dolt versioning for permanent issues.
-		// GH#2455: Stage only the tables we modified, then commit without -A.
-		for _, table := range []string{"issues", "events"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
 		commitMsg := fmt.Sprintf("bd: close %s", id)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
+		return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
 	})
 }
 
@@ -630,17 +567,8 @@ func (s *DoltStore) CloseIssueChecked(ctx context.Context, id string, actor stri
 		}
 		result = storage.CloseIssueResult{Unchanged: res.AlreadyClosed, OpenChildren: res.OpenChildren}
 
-		// Dolt versioning for permanent issues.
-		// GH#2455: Stage only the tables we modified, then commit without -A.
-		for _, table := range []string{"issues", "events"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
 		commitMsg := fmt.Sprintf("bd: close %s", id)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
+		return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
 	}); err != nil {
 		return storage.CloseIssueResult{}, err
 	}
@@ -659,15 +587,10 @@ func (s *DoltStore) DeleteIssue(ctx context.Context, id string) error {
 			return err
 		}
 
-		for _, table := range []string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
 		commitMsg := fmt.Sprintf("bd: delete %s", id)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
+		return s.doltAddAndCommitInTx(ctx, tx,
+			[]string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"},
+			commitMsg)
 	}); err != nil {
 		return err
 	}
@@ -736,15 +659,10 @@ func (s *DoltStore) DeleteIssues(ctx context.Context, ids []string, cascade bool
 			return nil
 		}
 
-		for _, table := range []string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
 		commitMsg := fmt.Sprintf("bd: delete %d issue(s)", result.DeletedCount)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
+		return s.doltAddAndCommitInTx(ctx, tx,
+			[]string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"},
+			commitMsg)
 	}); err != nil {
 		// Preserve partial result (e.g., OrphanedIssues) on error.
 		if result != nil {

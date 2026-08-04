@@ -79,11 +79,21 @@ func (s *DoltStore) runInTransaction(
 ) error {
 	return s.withRetry(ctx, func() error {
 		invoked := false
+		var callbackErr error
 		err := run(ctx, commitMsg, func(tx storage.Transaction) error {
 			invoked = true
-			return fn(tx)
+			callbackErr = fn(tx)
+			return callbackErr
 		})
 		if invoked && err != nil {
+			// Callback failures are caller-owned and must not affect server
+			// health accounting. Infrastructure failures after a successful
+			// callback keep the at-most-once boundary too, except an explicitly
+			// indeterminate commit reaches withRetry so it can record the lost
+			// connection before stopping without replay.
+			if callbackErr == nil && errors.Is(err, ErrCommitIndeterminate) {
+				return err
+			}
 			return backoff.Permanent(err)
 		}
 		return err

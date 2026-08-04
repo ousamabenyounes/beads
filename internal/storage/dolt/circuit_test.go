@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -638,6 +639,41 @@ func TestRunInTransactionPermanentCallbackErrorsDoNotTripCircuit(t *testing.T) {
 	}
 	if unrelatedCalls != 1 {
 		t.Fatalf("unrelated operation calls = %d, want 1", unrelatedCalls)
+	}
+}
+
+func TestRunInTransactionPostCallbackIndeterminateFailureTripsCircuitWithoutReplay(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	breaker := newTestCircuitBreaker(t)
+	store := &DoltStore{breaker: breaker}
+	infraErr := fmt.Errorf("commit response lost: %w: %w", testConnectionLoss, ErrCommitIndeterminate)
+	callbackCalls := 0
+	runnerCalls := 0
+
+	for i := 0; i < circuitFailureThreshold; i++ {
+		err := store.runInTransaction(context.Background(), "test: infrastructure commit", func(storage.Transaction) error {
+			callbackCalls++
+			return nil
+		}, func(_ context.Context, _ string, fn func(storage.Transaction) error) error {
+			runnerCalls++
+			if err := fn(nil); err != nil {
+				return err
+			}
+			return infraErr
+		})
+		if !errors.Is(err, ErrCommitIndeterminate) {
+			t.Fatalf("RunInTransaction attempt %d error = %v, want ErrCommitIndeterminate", i+1, err)
+		}
+		if callbackCalls != i+1 {
+			t.Fatalf("callback calls after attempt %d = %d, want %d (no replay)", i+1, callbackCalls, i+1)
+		}
+		if runnerCalls != i+1 {
+			t.Fatalf("transaction runner calls after attempt %d = %d, want %d (no replay)", i+1, runnerCalls, i+1)
+		}
+	}
+
+	if state := breaker.State(); state != circuitOpen {
+		t.Fatalf("circuit state after infrastructure commit failures = %q, want %q", state, circuitOpen)
 	}
 }
 
