@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
@@ -16,9 +17,9 @@ import (
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 )
 
-// federationStagingBranch is the temporary branch used to filter excluded
-// issue types before pushing to a federation peer.
-const federationStagingBranch = "__federation_push_staging"
+// federationStagingBranchPrefix identifies temporary filtered-push branches.
+// Each operation appends a UUID so concurrent pushes cannot collide.
+const federationStagingBranchPrefix = "__federation_push_staging_"
 
 // federationStagingCleanupTimeout bounds best-effort cleanup after the caller
 // has canceled or its deadline has expired.
@@ -441,6 +442,11 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 		return s.PushTo(ctx, peer)
 	}
 	sourceBranch := s.branch
+	operationID, err := uuid.NewRandom()
+	if err != nil {
+		return fmt.Errorf("federation filter: generate staging branch: %w", err)
+	}
+	stagingBranch := federationStagingBranchPrefix + operationID.String()
 
 	// Pin a single long-timeout connection for the session-scoped staging
 	// operation. RecomputeAllIsBlockedInTx can exceed the shared pool's
@@ -457,11 +463,8 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	}
 	defer conn.Close()
 
-	// Clean up any leftover staging branch from a previous failed run.
-	_ = schema.DrainCall(ctx, conn, "CALL DOLT_BRANCH('-Df', ?)", federationStagingBranch)
-
 	// Create staging branch from the current branch.
-	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?, ?)", federationStagingBranch, sourceBranch); err != nil {
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?, ?)", stagingBranch, sourceBranch); err != nil {
 		return fmt.Errorf("federation filter: create staging branch: %w", err)
 	}
 
@@ -482,7 +485,7 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 			if err := schema.DrainCall(cleanupCtx, cleanupConn, "CALL DOLT_CHECKOUT(?)", sourceBranch); err != nil {
 				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("restore branch %s: %w", sourceBranch, err))
 			}
-			if err := schema.DrainCall(cleanupCtx, cleanupConn, "CALL DOLT_BRANCH('-Df', ?)", federationStagingBranch); err != nil {
+			if err := schema.DrainCall(cleanupCtx, cleanupConn, "CALL DOLT_BRANCH('-Df', ?)", stagingBranch); err != nil {
 				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete staging branch: %w", err))
 			}
 		}
@@ -492,7 +495,7 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	}()
 
 	// Checkout staging branch.
-	if err := versioncontrolops.CheckoutBranch(ctx, conn, federationStagingBranch); err != nil {
+	if err := versioncontrolops.CheckoutBranch(ctx, conn, stagingBranch); err != nil {
 		return fmt.Errorf("federation filter: checkout staging: %w", err)
 	}
 
@@ -525,7 +528,7 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	}
 
 	// Push staging branch to peer, mapped to the peer's expected branch name.
-	refspec := federationStagingBranch + ":" + sourceBranch
+	refspec := stagingBranch + ":" + sourceBranch
 	return s.pushRefToPeer(ctx, peer, refspec)
 }
 

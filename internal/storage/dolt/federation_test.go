@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/types"
@@ -543,8 +545,8 @@ func TestFilteredPushExcludesWisp(t *testing.T) {
 		t.Fatalf("list branches: %v", err)
 	}
 	for _, b := range branches {
-		if b == federationStagingBranch {
-			t.Errorf("staging branch %s was not cleaned up", federationStagingBranch)
+		if strings.HasPrefix(b, federationStagingBranchPrefix) {
+			t.Errorf("staging branch %s was not cleaned up", b)
 		}
 	}
 
@@ -608,6 +610,64 @@ func TestFilteredPushUsesDedicatedLongTimeoutConnection(t *testing.T) {
 		t.Fatalf("filtered push failed before peer lookup: %v", err)
 	}
 	assertFederationStagingBranchAbsent(t, ctx, observer)
+}
+
+// TestFilteredPushConcurrentOperationsUseDistinctStagingBranches proves two
+// overlapping product calls cannot delete or replace each other's staging
+// branch. Both calls finish staging and block on the exhausted shared pool
+// before their branch names are observed.
+func TestFilteredPushConcurrentOperationsUseDistinctStagingBranches(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	seedFilteredPushGraph(t, ctx, store, "fed-concurrent-staging")
+	observer, err := store.openLongTimeoutConn()
+	if err != nil {
+		t.Fatalf("open staging observer: %v", err)
+	}
+	defer observer.Close()
+
+	store.db.SetMaxOpenConns(1)
+	held, err := store.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("exhaust shared pool: %v", err)
+	}
+	defer held.Close()
+	initialWaitCount := store.db.Stats().WaitCount
+
+	firstCtx, cancelFirst := context.WithCancel(ctx)
+	defer cancelFirst()
+	secondCtx, cancelSecond := context.WithCancel(ctx)
+	defer cancelSecond()
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- store.filteredPushToPeer(firstCtx, "nonexistent-peer", []string{"wisp"})
+	}()
+	waitForPoolWait(t, ctx, store.db, initialWaitCount)
+	go func() {
+		errCh <- store.filteredPushToPeer(secondCtx, "nonexistent-peer", []string{"wisp"})
+	}()
+	waitForPoolWait(t, ctx, store.db, initialWaitCount+1)
+
+	stagingBranches := listFederationStagingBranches(t, ctx, observer)
+	cancelFirst()
+	cancelSecond()
+	for range 2 {
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("overlapping filtered push error = %v, want context canceled", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("overlapping filtered push did not return after cancellation")
+		}
+	}
+	assertFederationStagingBranchAbsent(t, ctx, observer)
+	if len(stagingBranches) != 2 {
+		t.Fatalf("overlapping filtered pushes exposed staging branches %v, want 2 distinct branches", stagingBranches)
+	}
 }
 
 // TestFilteredPushCleanupSurvivesCallerCancellation cancels the caller while
@@ -907,18 +967,28 @@ func waitForFilteredStagingCommit(t *testing.T, ctx context.Context, observer *s
 			t.Fatalf("filtered push returned before publishing staging commit: %v", err)
 		default:
 		}
+		branches := listFederationStagingBranches(t, ctx, observer)
+		if len(branches) != 1 {
+			lastErr = fmt.Errorf("found staging branches %v, want exactly one", branches)
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		stagingBranch := branches[0]
+		if err := issueops.ValidateRef(stagingBranch); err != nil {
+			t.Fatalf("generated staging branch %q is invalid: %v", stagingBranch, err)
+		}
+		//nolint:gosec // stagingBranch is generated internally and validated as a Dolt ref above.
+		blockerQuery := fmt.Sprintf("SELECT COUNT(*) FROM issues AS OF '%s' WHERE id = ?", stagingBranch)
+		//nolint:gosec // stagingBranch is generated internally and validated as a Dolt ref above.
+		blockedQuery := fmt.Sprintf("SELECT is_blocked FROM issues AS OF '%s' WHERE id = ?", stagingBranch)
+		//nolint:gosec // stagingBranch is generated internally and validated as a Dolt ref above.
+		commitQuery := fmt.Sprintf("SELECT COUNT(*) FROM dolt_log('%s') WHERE message = ?", stagingBranch)
 		var blockerCount, commitCount int
 		var blocked bool
-		blockerErr := observer.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM issues AS OF '__federation_push_staging' WHERE id = ?", blockerID,
-		).Scan(&blockerCount)
-		blockedErr := observer.QueryRowContext(ctx,
-			"SELECT is_blocked FROM issues AS OF '__federation_push_staging' WHERE id = ?", waiterID,
-		).Scan(&blocked)
-		commitErr := observer.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM dolt_log('__federation_push_staging') WHERE message = ?",
-			"federation: exclude private issue types",
-		).Scan(&commitCount)
+		blockerErr := observer.QueryRowContext(ctx, blockerQuery, blockerID).Scan(&blockerCount)
+		blockedErr := observer.QueryRowContext(ctx, blockedQuery, waiterID).Scan(&blocked)
+		commitErr := observer.QueryRowContext(ctx, commitQuery,
+			"federation: exclude private issue types").Scan(&commitCount)
 		lastErr = errors.Join(blockerErr, blockedErr, commitErr)
 		if lastErr == nil && blockerCount == 0 && !blocked && commitCount == 1 {
 			return
@@ -946,15 +1016,33 @@ func waitForPoolWait(t *testing.T, ctx context.Context, db *sql.DB, initialWaitC
 
 func assertFederationStagingBranchAbsent(t *testing.T, ctx context.Context, db *sql.DB) {
 	t.Helper()
-	var count int
-	if err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM dolt_branches WHERE name = ?", federationStagingBranch,
-	).Scan(&count); err != nil {
-		t.Fatalf("query federation staging branch: %v", err)
+	if branches := listFederationStagingBranches(t, ctx, db); len(branches) != 0 {
+		t.Fatalf("federation staging branches = %v, want none", branches)
 	}
-	if count != 0 {
-		t.Fatalf("federation staging branch count = %d, want 0", count)
+}
+
+func listFederationStagingBranches(t *testing.T, ctx context.Context, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, `
+		SELECT name FROM dolt_branches
+		WHERE LEFT(name, ?) = ?
+		ORDER BY name`, len(federationStagingBranchPrefix), federationStagingBranchPrefix)
+	if err != nil {
+		t.Fatalf("query federation staging branches: %v", err)
 	}
+	defer rows.Close()
+	var branches []string
+	for rows.Next() {
+		var branch string
+		if err := rows.Scan(&branch); err != nil {
+			t.Fatalf("scan federation staging branch: %v", err)
+		}
+		branches = append(branches, branch)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate federation staging branches: %v", err)
+	}
+	return branches
 }
 
 // TestFilteredPushOptOut verifies that setting federation.exclude_types to
@@ -994,7 +1082,7 @@ func TestFilteredPushOptOut(t *testing.T) {
 		t.Fatalf("list branches: %v", err)
 	}
 	for _, b := range branches {
-		if b == federationStagingBranch {
+		if strings.HasPrefix(b, federationStagingBranchPrefix) {
 			t.Errorf("staging branch should not exist when exclude_types is empty")
 		}
 	}
@@ -1116,14 +1204,15 @@ func TestFilteredStagingPublishesRetainedWaiterUnblocked(t *testing.T) {
 	if seedLabelCount != 1 {
 		t.Fatalf("source blocker label count at HEAD = %d, want 1", seedLabelCount)
 	}
-	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?, ?)", federationStagingBranch, sourceBranch); err != nil {
+	stagingBranch := federationStagingBranchPrefix + "recompute-test"
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?, ?)", stagingBranch, sourceBranch); err != nil {
 		t.Fatalf("create staging branch: %v", err)
 	}
 	defer func() {
 		_ = schema.DrainCall(ctx, conn, "CALL DOLT_CHECKOUT(?)", sourceBranch)
-		_ = schema.DrainCall(ctx, conn, "CALL DOLT_BRANCH('-Df', ?)", federationStagingBranch)
+		_ = schema.DrainCall(ctx, conn, "CALL DOLT_BRANCH('-Df', ?)", stagingBranch)
 	}()
-	if err := versioncontrolops.CheckoutBranch(ctx, conn, federationStagingBranch); err != nil {
+	if err := versioncontrolops.CheckoutBranch(ctx, conn, stagingBranch); err != nil {
 		t.Fatalf("checkout staging branch: %v", err)
 	}
 	result, err := conn.ExecContext(ctx, "DELETE FROM issues WHERE issue_type = ?", types.TypeTask)
@@ -1177,8 +1266,8 @@ func TestFilteredPushStagingBranchCleanupOnError(t *testing.T) {
 		t.Fatalf("list branches: %v", err)
 	}
 	for _, b := range branches {
-		if b == federationStagingBranch {
-			t.Errorf("staging branch %s should be cleaned up after push error", federationStagingBranch)
+		if strings.HasPrefix(b, federationStagingBranchPrefix) {
+			t.Errorf("staging branch %s should be cleaned up after push error", b)
 		}
 	}
 }
