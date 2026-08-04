@@ -112,17 +112,24 @@ func (s *EmbeddedDoltStore) withMutatingPinnedDBConn(ctx context.Context, fn fun
 // if anything else writes concurrently.
 func (s *EmbeddedDoltStore) commitAll(ctx context.Context, message string, tolerateEmpty bool) (committed bool, err error) {
 	err = s.withConn(ctx, true, func(tx *sql.Tx) error {
-		if _, execErr := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?)", message); execErr != nil {
-			if tolerateEmpty && issueops.IsNothingToCommitError(execErr) {
-				committed = false
-				return nil
-			}
-			return fmt.Errorf("dolt commit: %w", execErr)
-		}
-		committed = true
-		return nil
+		var commitErr error
+		committed, commitErr = commitAllInTx(ctx, tx, message, tolerateEmpty)
+		return commitErr
 	})
 	return committed, err
+}
+
+func commitAllInTx(ctx context.Context, tx *sql.Tx, message string, tolerateEmpty bool) (bool, error) {
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?)", message); err != nil {
+		if issueops.IsNothingToCommitError(err) {
+			if tolerateEmpty {
+				return false, nil
+			}
+			return false, fmt.Errorf("dolt commit: %w", err)
+		}
+		return false, wrapCommitIndeterminate("dolt commit", err)
+	}
+	return true, nil
 }
 
 // Commit stages and commits the full working set. A clean working set is not
