@@ -190,7 +190,7 @@ func TestLegacyUpgradeGuardMetadataLessSQLiteAndCurrentEmbeddedPrecedence(t *tes
 		}
 	})
 
-	t.Run("explicit server metadata with missing version witness is admitted", func(t *testing.T) {
+	t.Run("explicit server metadata with missing version witness and local Dolt root is refused", func(t *testing.T) {
 		beadsDir := t.TempDir()
 		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt","dolt_mode":"server"}`), 0o600); err != nil {
 			t.Fatal(err)
@@ -198,12 +198,12 @@ func TestLegacyUpgradeGuardMetadataLessSQLiteAndCurrentEmbeddedPrecedence(t *tes
 		if err := os.Mkdir(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := guardLegacyUpgradeWorkspace(beadsDir); err != nil {
-			t.Fatalf("current server workspace with missing witness was refused: %v", err)
+		if err := guardLegacyUpgradeWorkspace(beadsDir); !isLegacyUpgradeRefusal(err) {
+			t.Fatalf("guardLegacyUpgradeWorkspace() = %v, want migration refusal", err)
 		}
 	})
 
-	t.Run("explicit server metadata with malformed version witness is admitted", func(t *testing.T) {
+	t.Run("explicit server metadata with malformed version witness and local Dolt root is refused", func(t *testing.T) {
 		beadsDir := t.TempDir()
 		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt","dolt_mode":"server"}`), 0o600); err != nil {
 			t.Fatal(err)
@@ -214,8 +214,24 @@ func TestLegacyUpgradeGuardMetadataLessSQLiteAndCurrentEmbeddedPrecedence(t *tes
 		if err := os.Mkdir(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
 			t.Fatal(err)
 		}
+		if err := guardLegacyUpgradeWorkspace(beadsDir); !isLegacyUpgradeRefusal(err) {
+			t.Fatalf("guardLegacyUpgradeWorkspace() = %v, want migration refusal", err)
+		}
+	})
+
+	t.Run("explicit server metadata with current version witness and local Dolt root is admitted", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt","dolt_mode":"server"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, localVersionFile), []byte("1.1.2\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
+			t.Fatal(err)
+		}
 		if err := guardLegacyUpgradeWorkspace(beadsDir); err != nil {
-			t.Fatalf("current server workspace with malformed witness was refused: %v", err)
+			t.Fatalf("current server workspace with current witness was refused: %v", err)
 		}
 	})
 

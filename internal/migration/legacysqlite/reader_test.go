@@ -89,6 +89,42 @@ func TestExportAcceptsAuthenticEmptyOptionalFields(t *testing.T) {
 	}
 }
 
+func TestExportNormalizesNullRemovedFieldsAndCompactionLevel(t *testing.T) {
+	db, path := legacyFixture(t, "0.49.6")
+	mustExec(t, db, `UPDATE issues
+		SET closed_by_session=NULL, role_type=NULL, rig=NULL, compaction_level=NULL,
+			description='preserve me', metadata='{"keep":"me"}'
+		WHERE id='old-1'`)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Export(context.Background(), path, "-", &out); err != nil {
+		t.Fatal(err)
+	}
+	var issues []types.Issue
+	for _, line := range bytes.Split(bytes.TrimSpace(out.Bytes()), []byte{'\n'}) {
+		var issue types.Issue
+		if err := json.Unmarshal(line, &issue); err != nil {
+			t.Fatal(err)
+		}
+		issues = append(issues, issue)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("exported %d issues, want 2", len(issues))
+	}
+	if issues[0].ID != "old-1" {
+		t.Fatalf("first issue = %q, want old-1", issues[0].ID)
+	}
+	if issues[0].ClosedBySession != "" || issues[0].CompactionLevel != 0 {
+		t.Fatalf("NULL legacy sentinels were not normalized: %#v", issues[0])
+	}
+	if issues[0].Title != "old-1" || issues[0].Description != "preserve me" || string(issues[0].Metadata) != `{"keep":"me"}` {
+		t.Fatalf("export lost non-sentinel data: %#v", issues[0])
+	}
+}
+
 func TestExportRejectsUnauthenticatedOrUnsafeLegacySQLite(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

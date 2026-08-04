@@ -393,7 +393,7 @@ func verifyFKs(ctx context.Context, db *sql.Tx, table string) error {
 // the variadic ScanIssueFrom boundary hides any count mismatch from the
 // compiler, so TestLoadIssuesProjectionArity guards the invariant and makes the
 // drift fail at test time instead of mid-migration.
-const loadIssuesProjection = `id,content_hash,title,description,design,acceptance_criteria,notes,status,priority,issue_type,assignee,estimated_minutes,CAST(created_at AS TEXT),created_by,owner,CAST(updated_at AS TEXT),NULL,NULL,external_ref,spec_id,compaction_level,NULL,compacted_at_commit,original_size,source_repo,close_reason,NULL,sender,ephemeral,0,wisp_type,pinned,is_template,await_type,await_id,timeout_ns,NULL,mol_type,event_kind,actor,target,payload,NULL,NULL,work_type,source_system,NULL,0,NULL,NULL,NULL,NULL,closed_by_session,CAST(deleted_at AS TEXT),deleted_by,delete_reason,original_type,crystallizes,quality_score,hook_bead,role_bead,agent_state,CAST(last_activity AS TEXT),role_type,rig,metadata,waiters,ephemeral,pinned,is_template,estimated_minutes,compaction_level,original_size,CAST(closed_at AS TEXT),CAST(compacted_at AS TEXT),CAST(due_at AS TEXT),CAST(defer_until AS TEXT)`
+const loadIssuesProjection = `id,content_hash,title,description,design,acceptance_criteria,notes,status,priority,issue_type,assignee,estimated_minutes,CAST(created_at AS TEXT),created_by,owner,CAST(updated_at AS TEXT),NULL,NULL,external_ref,spec_id,COALESCE(compaction_level,0),NULL,compacted_at_commit,original_size,source_repo,close_reason,NULL,sender,ephemeral,0,wisp_type,pinned,is_template,await_type,await_id,timeout_ns,NULL,mol_type,event_kind,actor,target,payload,NULL,NULL,work_type,source_system,NULL,0,NULL,NULL,NULL,NULL,closed_by_session,CAST(deleted_at AS TEXT),deleted_by,delete_reason,original_type,crystallizes,quality_score,hook_bead,role_bead,agent_state,CAST(last_activity AS TEXT),role_type,rig,metadata,waiters,ephemeral,pinned,is_template,estimated_minutes,compaction_level,original_size,CAST(closed_at AS TEXT),CAST(compacted_at AS TEXT),CAST(due_at AS TEXT),CAST(defer_until AS TEXT)`
 
 func loadIssues(ctx context.Context, db *sql.Tx) ([]*types.Issue, error) {
 	rows, err := db.QueryContext(ctx, "SELECT "+loadIssuesProjection+" FROM issues ORDER BY id")
@@ -431,13 +431,12 @@ func (x *legacyExtras) scanDests() []any {
 }
 
 type legacyExtras struct {
-	closedBy                                                                                                          string
-	deletedAt, deletedBy, deleteReason, originalType, hookBead, roleBead, agentState, lastActivity, metadata, waiters sql.NullString
-	closedAt, compactedAt, dueAt, deferUntil                                                                          sql.NullString
-	crystallizes, ephemeral, pinned, template                                                                         sql.NullInt64
-	estimatedMinutes, compactionLevel, originalSize                                                                   sql.NullInt64
-	quality                                                                                                           sql.NullFloat64
-	roleType, rig                                                                                                     string
+	closedBy, deletedAt, deletedBy, deleteReason, originalType, hookBead, roleBead, agentState, lastActivity, metadata, waiters sql.NullString
+	closedAt, compactedAt, dueAt, deferUntil                                                                                    sql.NullString
+	crystallizes, ephemeral, pinned, template                                                                                   sql.NullInt64
+	estimatedMinutes, compactionLevel, originalSize                                                                             sql.NullInt64
+	quality                                                                                                                     sql.NullFloat64
+	roleType, rig                                                                                                               sql.NullString
 }
 
 func (x legacyExtras) validate(issue *types.Issue) error {
@@ -565,7 +564,7 @@ func checkRequiredScalars(issue *types.Issue) error {
 // checkRemovedFields rejects legacy rows that populate columns the current
 // schema no longer supports, then validates the tri-state boolean columns.
 func (x legacyExtras) checkRemovedFields(issue *types.Issue) error {
-	if x.closedBy != "" || x.deletedAt.Valid || nonempty(x.deletedBy, x.deleteReason, x.originalType, x.hookBead, x.roleBead, x.agentState, x.lastActivity) || x.crystallizes.Int64 != 0 || x.quality.Valid || x.roleType != "" || x.rig != "" || (issue.SourceRepo != "" && issue.SourceRepo != ".") {
+	if nonempty(x.closedBy, x.deletedBy, x.deleteReason, x.originalType, x.hookBead, x.roleBead, x.agentState, x.lastActivity, x.roleType, x.rig) || x.deletedAt.Valid || x.crystallizes.Int64 != 0 || x.quality.Valid || (issue.SourceRepo != "" && issue.SourceRepo != ".") {
 		return fmt.Errorf("legacy SQLite issue %s uses unsupported removed fields", issue.ID)
 	}
 	for _, b := range []struct {

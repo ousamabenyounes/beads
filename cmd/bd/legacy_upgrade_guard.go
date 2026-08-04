@@ -42,12 +42,19 @@ func guardLegacyUpgradeWorkspace(beadsDir string) error {
 		return nil
 	}
 	version, ok := legacyUpgradeVersionWitness(beadsDir)
-	if cfg != nil && strings.EqualFold(cfg.DoltMode, configfile.DoltModeServer) &&
-		ok && legacyServerVersion(version) {
+	serverMode := cfg != nil && strings.EqualFold(cfg.DoltMode, configfile.DoltModeServer)
+	if serverMode && ok && legacyServerVersion(version) {
 		return legacyUpgradeRefusal(fmt.Sprintf("legacy Dolt server workspace from bd %s", version))
 	}
-	if !hasLegacyDoltRoot(beadsDir) {
+	hasLocalDoltRoot := hasLegacyDoltRoot(beadsDir)
+	if !hasLocalDoltRoot {
 		return nil
+	}
+	if serverMode {
+		if currentVersionWitness(version) {
+			return nil
+		}
+		return legacyUpgradeRefusal("legacy Dolt server workspace")
 	}
 	if cfg == nil || cfg.DoltMode == "" ||
 		strings.EqualFold(cfg.DoltMode, configfile.DoltModeEmbedded) {
@@ -242,6 +249,25 @@ func legacyUpgradeVersionWitness(beadsDir string) (string, bool) {
 func legacyServerVersion(version string) bool {
 	minor, ok := legacyVersionMinor(version)
 	return ok && minor >= 55 && minor <= 62
+}
+
+// currentVersionWitness identifies a syntactically valid post-1.0 version
+// marker. A local Dolt root in server mode is ambiguous without it, so that
+// shape must be refused rather than opened as a historical schema.
+func currentVersionWitness(version string) bool {
+	parts := strings.Split(strings.TrimPrefix(version, "v"), ".")
+	if len(parts) != 3 {
+		return false
+	}
+	values := make([]int, len(parts))
+	for i, part := range parts {
+		value, err := strconv.Atoi(part)
+		if err != nil || value < 0 {
+			return false
+		}
+		values[i] = value
+	}
+	return values[0] >= 1
 }
 
 func legacyVersionMinor(version string) (int, bool) {
