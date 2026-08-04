@@ -39,8 +39,6 @@ jobs:
             cache-identity: v0.17.0-d4d08617a324c85b45c9628bc519d659a9ff9c7c37da67aa48727e0af7f19a75
           - version: v0.49.6
             cache-identity: v0.49.6-8546dc9a47e11dc31ac2bc9a0224a9c690975e91850932cbb62623053fbb7db8
-          - version: v0.50.2
-            cache-identity: v0.50.2-361cf95eb640c31519df668c117c384befeee4a093b5711a1f69a87bb226085c
           - version: v0.50.3
             cache-identity: v0.50.3-e94b09e0b6a9324bbc0e81ea36bccaaa42172a926bfedfb389e9a26dedb63184
           - version: v0.55.4
