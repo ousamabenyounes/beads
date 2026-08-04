@@ -18,9 +18,12 @@ import (
 type failureDriver struct {
 	begins     atomic.Int32
 	prepares   atomic.Int32
+	execs      atomic.Int32
 	failBegin  atomic.Int32
 	commitMu   sync.Mutex
 	commitErrs []error
+	commitErr  error
+	commitFunc func() error
 }
 
 var testConnectionLoss = errors.New("invalid connection")
@@ -38,6 +41,10 @@ func (c *failureConn) Prepare(string) (driver.Stmt, error) {
 	return nil, errors.New("failure driver does not prepare statements")
 }
 func (c *failureConn) Close() error { return nil }
+func (c *failureConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	c.driver.execs.Add(1)
+	return driver.RowsAffected(1), nil
+}
 func (c *failureConn) Begin() (driver.Tx, error) {
 	c.driver.begins.Add(1)
 	if c.driver.failBegin.Load() > 0 {
@@ -50,6 +57,9 @@ func (c *failureConn) Begin() (driver.Tx, error) {
 type failureTx struct{ driver *failureDriver }
 
 func (t *failureTx) Commit() error {
+	if t.driver.commitFunc != nil {
+		return t.driver.commitFunc()
+	}
 	return t.driver.nextCommitError()
 }
 func (t *failureTx) Rollback() error { return nil }
@@ -58,7 +68,7 @@ func (d *failureDriver) nextCommitError() error {
 	d.commitMu.Lock()
 	defer d.commitMu.Unlock()
 	if len(d.commitErrs) == 0 {
-		return nil
+		return d.commitErr
 	}
 	err := d.commitErrs[0]
 	d.commitErrs = d.commitErrs[1:]
@@ -66,6 +76,7 @@ func (d *failureDriver) nextCommitError() error {
 }
 
 var _ driver.Connector = (*failureDriver)(nil)
+var _ driver.ExecerContext = (*failureConn)(nil)
 
 func newFailureStore(d *failureDriver) *DoltStore {
 	return &DoltStore{db: sql.OpenDB(d)}
@@ -131,7 +142,7 @@ func TestTyped1105CommitErrorIsDefiniteAndNotRetried(t *testing.T) {
 	if !errors.Is(err, cause) {
 		t.Fatalf("withRetryTx() error = %v, want %v", err, cause)
 	}
-	if errors.Is(err, errCommitPhase) {
+	if errors.Is(err, ErrCommitIndeterminate) {
 		t.Fatalf("withRetryTx() error = %v must not be marked commit-indeterminate", err)
 	}
 	if got := driver.begins.Load(); got != 1 {
@@ -139,6 +150,23 @@ func TestTyped1105CommitErrorIsDefiniteAndNotRetried(t *testing.T) {
 	}
 	if got := callbacks.Load(); got != 1 {
 		t.Errorf("callback invocations = %d, want 1", got)
+	}
+}
+
+func TestWithWriteTxPacketSyncCommitIsIndeterminate(t *testing.T) {
+	driver := &failureDriver{commitErr: mysql.ErrPktSync}
+	store := newFailureStore(driver)
+	defer func() { _ = store.db.Close() }()
+
+	err := store.withRetryTx(context.Background(), func(*sql.Tx) error { return nil })
+	if !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("withRetryTx() error = %v, want ErrCommitIndeterminate", err)
+	}
+	if !errors.Is(err, mysql.ErrPktSync) {
+		t.Fatalf("withRetryTx() error = %v, want cause %v", err, mysql.ErrPktSync)
+	}
+	if got := driver.begins.Load(); got != 1 {
+		t.Fatalf("write attempts = %d, want 1", got)
 	}
 }
 
@@ -155,5 +183,35 @@ func TestPreCommitConnectionLossIsRetriedSilently(t *testing.T) {
 	}
 	if got := driver.begins.Load(); got != 3 {
 		t.Errorf("Begin calls = %d, want 3", got)
+	}
+}
+
+func TestExecContextCommitResponseLossIsIndeterminateAndMutationRunsOnce(t *testing.T) {
+	var commitCalls atomic.Int32
+	driver := &failureDriver{}
+	driver.commitFunc = func() error {
+		if commitCalls.Add(1) == 1 {
+			return testConnectionLoss
+		}
+		return nil
+	}
+	store := newFailureStore(driver)
+	defer func() { _ = store.db.Close() }()
+
+	_, err := store.execContext(context.Background(), "UPDATE issues SET title = ?", "changed")
+	if !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("execContext() error = %v, want ErrCommitIndeterminate", err)
+	}
+	if !errors.Is(err, testConnectionLoss) {
+		t.Fatalf("execContext() error = %v, want cause %v", err, testConnectionLoss)
+	}
+	if got := driver.execs.Load(); got != 1 {
+		t.Fatalf("SQL mutation calls = %d, want 1", got)
+	}
+	if got := driver.begins.Load(); got != 1 {
+		t.Fatalf("transaction begins = %d, want 1", got)
+	}
+	if got := commitCalls.Load(); got != 1 {
+		t.Fatalf("commit calls = %d, want 1", got)
 	}
 }

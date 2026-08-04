@@ -2,10 +2,15 @@ package dolt
 
 import (
 	"context"
+	"errors"
 	"regexp"
+	"strings"
 	"testing"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	mysql "github.com/go-sql-driver/mysql"
+
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 // TestDoltAddAndCommitDrainsCallResultSets pins doltAddAndCommit to routing its
@@ -43,6 +48,133 @@ func TestDoltAddAndCommitDrainsCallResultSets(t *testing.T) {
 		t.Fatalf("doltAddAndCommit: %v", err)
 	}
 
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestDoltAddAndCommitPostSQLFailuresAreIndeterminate(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		setup       func(sqlmock.Sqlmock)
+		closeDB     bool
+		cause       error
+		mysqlNumber uint16
+		wantContext string
+	}{
+		{
+			name:        "connection acquisition",
+			setup:       func(sqlmock.Sqlmock) {},
+			closeDB:     true,
+			wantContext: "acquire connection after SQL mutation",
+		},
+		{
+			name: "DOLT_ADD",
+			setup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+					WithArgs("issues").
+					WillReturnError(testConnectionLoss)
+			},
+			cause:       testConnectionLoss,
+			wantContext: "dolt add issues after SQL mutation",
+		},
+		{
+			name: "untyped DOLT_COMMIT",
+			setup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+					WithArgs("issues").
+					WillReturnRows(sqlmock.NewRows([]string{"status"}))
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
+					WithArgs("bd: test commit", " <>").
+					WillReturnError(testConnectionLoss)
+			},
+			cause:       testConnectionLoss,
+			wantContext: "dolt commit after SQL mutation",
+		},
+		{
+			name: "typed deadlock DOLT_COMMIT",
+			setup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+					WithArgs("issues").
+					WillReturnRows(sqlmock.NewRows([]string{"status"}))
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
+					WithArgs("bd: test commit", " <>").
+					WillReturnError(&mysql.MySQLError{Number: 1213, Message: "deadlock"})
+			},
+			mysqlNumber: 1213,
+			wantContext: "dolt commit after SQL mutation",
+		},
+		{
+			name: "typed lock wait DOLT_COMMIT",
+			setup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+					WithArgs("issues").
+					WillReturnRows(sqlmock.NewRows([]string{"status"}))
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
+					WithArgs("bd: test commit", " <>").
+					WillReturnError(&mysql.MySQLError{Number: 1205, Message: "lock wait timeout"})
+			},
+			mysqlNumber: 1205,
+			wantContext: "dolt commit after SQL mutation",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+
+			tc.setup(mock)
+			store := &DoltStore{db: db}
+			if tc.closeDB {
+				mock.ExpectClose()
+				if err := db.Close(); err != nil {
+					t.Fatalf("close database: %v", err)
+				}
+			}
+
+			err = store.doltAddAndCommit(context.Background(), []string{"issues"}, "bd: test commit")
+			if !errors.Is(err, storage.ErrCommitIndeterminate) {
+				t.Fatalf("doltAddAndCommit() error = %v, want ErrCommitIndeterminate", err)
+			}
+			if tc.cause != nil && !errors.Is(err, tc.cause) {
+				t.Errorf("doltAddAndCommit() error = %v, want cause %v", err, tc.cause)
+			}
+			if tc.mysqlNumber != 0 {
+				var mysqlErr *mysql.MySQLError
+				if !errors.As(err, &mysqlErr) || mysqlErr.Number != tc.mysqlNumber {
+					t.Errorf("doltAddAndCommit() error = %v, want MySQL %d", err, tc.mysqlNumber)
+				}
+			}
+			if !strings.Contains(err.Error(), tc.wantContext) {
+				t.Errorf("doltAddAndCommit() error = %q, want context %q", err, tc.wantContext)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet sqlmock expectations: %v", err)
+			}
+		})
+	}
+}
+
+func TestDoltAddAndCommitTreatsNothingToCommitAsSuccess(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+		WithArgs("issues").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
+		WithArgs("bd: test commit", " <>").
+		WillReturnError(errors.New("nothing to commit"))
+
+	store := &DoltStore{db: db}
+	if err := store.doltAddAndCommit(context.Background(), []string{"issues"}, "bd: test commit"); err != nil {
+		t.Fatalf("doltAddAndCommit() error = %v, want nil", err)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sqlmock expectations: %v", err)
 	}

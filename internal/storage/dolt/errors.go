@@ -1,13 +1,9 @@
 package dolt
 
 import (
-	"context"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,9 +90,9 @@ func isDoltAutocommitRollbackError(err error) bool {
 			strings.HasPrefix(mysqlErr.Message, "Merge conflict detected, @autocommit transaction rolled back."))
 }
 
-// isIndeterminateCommitResponse reports response-loss and network errors from
-// a commit-capable operation. A typed MySQL error proves the server responded,
-// even if its message contains connection-like text.
+// isIndeterminateCommitResponse reports whether a Commit error lacks a decoded
+// server response proving a definite rejection or rollback. Every untyped
+// protocol or transport error is conservatively indeterminate.
 func isIndeterminateCommitResponse(err error) bool {
 	if err == nil {
 		return false
@@ -105,34 +101,14 @@ func isIndeterminateCommitResponse(err error) bool {
 		return true
 	}
 	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) {
-		return false
+	return !errors.As(err, &mysqlErr)
+}
+
+func wrapSQLCommitError(op string, err error) error {
+	if isIndeterminateCommitResponse(err) {
+		return fmt.Errorf("%s: %w: %w", op, err, ErrCommitIndeterminate)
 	}
-	if errors.Is(err, driver.ErrBadConn) ||
-		errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, io.EOF) ||
-		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, net.ErrClosed) {
-		return true
-	}
-	var netErr *net.OpError
-	if errors.As(err, &netErr) {
-		return true
-	}
-	message := strings.ToLower(err.Error())
-	if strings.Contains(message, "response lost") ||
-		(strings.Contains(message, "commit response") && strings.Contains(message, "lost")) {
-		return true
-	}
-	return strings.Contains(message, "connection lost") ||
-		strings.Contains(message, "connection reset") ||
-		strings.Contains(message, "broken pipe") ||
-		strings.Contains(message, "i/o timeout") ||
-		strings.Contains(message, "bad connection") ||
-		strings.Contains(message, "invalid connection") ||
-		strings.Contains(message, "lost connection") ||
-		strings.Contains(message, "gone away")
+	return fmt.Errorf("%s: %w", op, err)
 }
 
 // wrapDBError wraps a database error with operation context.

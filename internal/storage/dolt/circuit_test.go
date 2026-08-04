@@ -12,6 +12,8 @@ import (
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
+
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 func TestCircuitBreaker_InitiallyAllows(t *testing.T) {
@@ -593,6 +595,49 @@ func TestWithRetryTyped1105DoesNotRetryOrTripCircuit(t *testing.T) {
 	}
 	if state := breaker.State(); state != circuitClosed {
 		t.Fatalf("circuit state = %q, want %q", state, circuitClosed)
+	}
+}
+
+func TestRunInTransactionPermanentCallbackErrorsDoNotTripCircuit(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	breaker := newTestCircuitBreaker(t)
+	store := &DoltStore{breaker: breaker}
+	callbackErr := errors.New("invalid connection")
+	callbackCalls := 0
+	runnerCalls := 0
+
+	for i := 0; i < circuitFailureThreshold; i++ {
+		err := store.runInTransaction(context.Background(), "test: external callback", func(storage.Transaction) error {
+			callbackCalls++
+			return callbackErr
+		}, func(_ context.Context, _ string, fn func(storage.Transaction) error) error {
+			runnerCalls++
+			return fn(nil)
+		})
+		if !errors.Is(err, callbackErr) {
+			t.Fatalf("RunInTransaction attempt %d error = %v, want %v", i+1, err, callbackErr)
+		}
+	}
+
+	if callbackCalls != circuitFailureThreshold {
+		t.Fatalf("callback calls = %d, want %d", callbackCalls, circuitFailureThreshold)
+	}
+	if runnerCalls != circuitFailureThreshold {
+		t.Fatalf("transaction runner calls = %d, want %d", runnerCalls, circuitFailureThreshold)
+	}
+	if state := breaker.State(); state != circuitClosed {
+		t.Fatalf("circuit state after external callback errors = %q, want %q", state, circuitClosed)
+	}
+
+	unrelatedCalls := 0
+	if err := store.withRetry(context.Background(), func() error {
+		unrelatedCalls++
+		return nil
+	}); err != nil {
+		t.Fatalf("unrelated operation after callback errors: %v", err)
+	}
+	if unrelatedCalls != 1 {
+		t.Fatalf("unrelated operation calls = %d, want 1", unrelatedCalls)
 	}
 }
 

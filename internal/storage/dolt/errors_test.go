@@ -23,7 +23,10 @@ func TestIsIndeterminateCommitResponse(t *testing.T) {
 	}{
 		{name: "unexpected EOF", err: io.ErrUnexpectedEOF, want: true},
 		{name: "lost connection", err: errors.New("lost connection to MySQL server"), want: true},
+		{name: "packet protocol desync", err: mysql.ErrPktSync, want: true},
+		{name: "otherwise unproven untyped commit error", err: errors.New("commit rejected without typed response"), want: true},
 		{name: "typed semantic MySQL error", err: &mysql.MySQLError{Number: 1105, Message: "connection lost while validating commit"}, want: false},
+		{name: "typed rollback-guaranteed MySQL error", err: &mysql.MySQLError{Number: 1213, Message: "deadlock"}, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isIndeterminateCommitResponse(tc.err); got != tc.want {

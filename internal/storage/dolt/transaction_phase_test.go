@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	mysql "github.com/go-sql-driver/mysql"
 
 	"github.com/steveyegge/beads/internal/storage"
 )
@@ -80,6 +81,38 @@ func TestRunInTransactionStageFailureAfterRegularCommitIsIndeterminateAndNotRepl
 	})
 	if !errors.Is(err, ErrCommitIndeterminate) {
 		t.Fatalf("error = %v, want ErrCommitIndeterminate", err)
+	}
+	if callbackCalls != 1 {
+		t.Fatalf("callback calls = %d, want 1", callbackCalls)
+	}
+	if runnerCalls != 1 {
+		t.Fatalf("transaction runner calls = %d, want 1", runnerCalls)
+	}
+	requireTransactionPhaseMocks(t, regularMock, ignoredMock)
+}
+
+func TestRunInTransactionRegularPacketSyncCommitIsIndeterminateAndNotReplayed(t *testing.T) {
+	store, conn, tx, regularMock, ignoredMock := newTransactionPhaseFixture(t)
+	regularMock.ExpectCommit().WillReturnError(mysql.ErrPktSync)
+	ignoredMock.ExpectRollback()
+
+	callbackCalls := 0
+	runnerCalls := 0
+	err := store.runInTransaction(context.Background(), "test: packet sync", func(storage.Transaction) error {
+		callbackCalls++
+		return nil
+	}, func(ctx context.Context, commitMsg string, fn func(storage.Transaction) error) error {
+		runnerCalls++
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return store.finishDoltTransaction(ctx, conn, tx, commitMsg)
+	})
+	if !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("error = %v, want ErrCommitIndeterminate", err)
+	}
+	if !errors.Is(err, mysql.ErrPktSync) {
+		t.Fatalf("error = %v, want cause %v", err, mysql.ErrPktSync)
 	}
 	if callbackCalls != 1 {
 		t.Fatalf("callback calls = %d, want 1", callbackCalls)

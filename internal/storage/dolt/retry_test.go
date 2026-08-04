@@ -126,6 +126,21 @@ func TestIsRetryableError(t *testing.T) {
 			expected: false,
 		},
 		{
+			name:     "typed read-only 1105 is retryable",
+			err:      &mysql.MySQLError{Number: 1105, Message: "cannot update manifest: database is read only"},
+			expected: true,
+		},
+		{
+			name:     "wrapped typed read-only 1105 is retryable case-insensitively",
+			err:      fmt.Errorf("write issue: %w", &mysql.MySQLError{Number: 1105, Message: "Cannot Update Manifest: Database Is Read Only"}),
+			expected: true,
+		},
+		{
+			name:     "read-only text on another typed code is not retryable",
+			err:      &mysql.MySQLError{Number: 1064, Message: "database is read only"},
+			expected: false,
+		},
+		{
 			name:     "typed setup 1049 is not generically retryable",
 			err:      &mysql.MySQLError{Number: 1049, Message: "Unknown database 'beads_test'"},
 			expected: false,

@@ -766,6 +766,20 @@ func (s *DoltStore) withRetry(ctx context.Context, op func() error) error {
 	err := backoff.Retry(func() error {
 		attempts++
 		err := op()
+		var permanent *backoff.PermanentError
+		if err != nil && errors.As(err, &permanent) {
+			return err
+		}
+		if err != nil && errors.Is(err, ErrCommitIndeterminate) {
+			if s.breaker != nil && isConnectionError(err) {
+				s.breaker.RecordFailure()
+				if s.breaker.State() == circuitOpen {
+					doltMetrics.circuitTrips.Add(ctx, 1)
+					return backoff.Permanent(fmt.Errorf("%w (circuit breaker tripped)", err))
+				}
+			}
+			return backoff.Permanent(err)
+		}
 		if err != nil && isRetryableError(err) {
 			// Record connection-level failures to the circuit breaker
 			if s.breaker != nil && isConnectionError(err) {
@@ -1075,17 +1089,7 @@ func (s *DoltStore) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 		return errors.Join(err, tx.Rollback())
 	}
 	if err := tx.Commit(); err != nil {
-		// A decoded MySQL error is a definite server response. In particular,
-		// Dolt's rollback-guaranteed 1105 must remain eligible for full-tx
-		// replay, while unrelated typed responses must return as definite errors.
-		var mysqlErr *mysql.MySQLError
-		if errors.As(err, &mysqlErr) {
-			return fmt.Errorf("commit write tx: %w", err)
-		}
-		if isIndeterminateCommitResponse(err) {
-			return fmt.Errorf("commit write tx: %w: %w", err, ErrCommitIndeterminate)
-		}
-		return fmt.Errorf("commit write tx: %w", err)
+		return wrapSQLCommitError("commit write tx", err)
 	}
 	return nil
 }
@@ -1115,7 +1119,10 @@ func (s *DoltStore) execContext(ctx context.Context, query string, args ...any) 
 			_ = tx.Rollback()
 			return execErr
 		}
-		return tx.Commit()
+		if commitErr := tx.Commit(); commitErr != nil {
+			return wrapSQLCommitError("commit exec tx", commitErr)
+		}
+		return nil
 	})
 	finalErr := wrapLockError(err)
 	endSpan(span, finalErr)
@@ -3003,22 +3010,24 @@ func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error 
 
 // doltAddAndCommit stages the specified tables and commits on a pinned
 // connection. This prevents DOLT_COMMIT('-Am') from sweeping up stale
-// working set changes from concurrent operations (GH#2455).
+// working set changes from concurrent operations (GH#2455). Every caller has
+// already committed its SQL mutation, so any publication failure here has an
+// indeterminate durable outcome and must not be replayed.
 func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commitMsg string) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to acquire connection: %w", err)
+		return fmt.Errorf("acquire connection after SQL mutation: %w: %w", err, ErrCommitIndeterminate)
 	}
 	defer conn.Close()
 
 	for _, table := range tables {
 		if err := schema.DrainCall(ctx, conn, "CALL DOLT_ADD(?)", table); err != nil {
-			return fmt.Errorf("dolt add %s: %w", table, err)
+			return fmt.Errorf("dolt add %s after SQL mutation: %w: %w", table, err, ErrCommitIndeterminate)
 		}
 	}
 	if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-		return fmt.Errorf("dolt commit: %w", err)
+		return fmt.Errorf("dolt commit after SQL mutation: %w: %w", err, ErrCommitIndeterminate)
 	}
 	return nil
 }

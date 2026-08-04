@@ -189,13 +189,7 @@ func (s *DoltStore) runDoltTransaction(ctx context.Context, commitMsg string, fn
 func (s *DoltStore) finishDoltTransaction(ctx context.Context, conn *sql.Conn, tx *doltTransaction, commitMsg string) error {
 	if err := tx.regularTx.Commit(); err != nil {
 		_ = tx.ignoredTx.Rollback()
-		if isSerializationError(err) {
-			return fmt.Errorf("sql commit (regular): %w", err)
-		}
-		if isIndeterminateCommitResponse(err) {
-			return fmt.Errorf("sql commit (regular): %w: %w", err, ErrCommitIndeterminate)
-		}
-		return fmt.Errorf("sql commit (regular): %w", err)
+		return wrapSQLCommitError("sql commit (regular)", err)
 	}
 
 	if err := versioncontrolops.StageAndCommit(ctx, conn, tx.dirty.DirtyTables(), commitMsg, s.commitAuthorString()); err != nil {
