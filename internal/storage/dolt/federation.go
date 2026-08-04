@@ -2,6 +2,7 @@ package dolt
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -480,9 +481,8 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	}
 
 	if deleted {
-		if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?)",
-			"federation: exclude private issue types"); err != nil {
-			return fmt.Errorf("federation filter: commit filtered state: %w", err)
+		if err := s.commitFilteredStaging(ctx, conn); err != nil {
+			return err
 		}
 	}
 
@@ -494,6 +494,28 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	// Push staging branch to peer, mapped to the peer's expected branch name.
 	refspec := federationStagingBranch + ":" + s.branch
 	return s.pushRefToPeer(ctx, peer, refspec)
+}
+
+// commitFilteredStaging repairs and commits the filtered graph on the staging
+// branch selected by conn. Dolt branch state is session-scoped, so every step
+// stays on that pinned connection.
+func (s *DoltStore) commitFilteredStaging(ctx context.Context, conn *sql.Conn) error {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("federation filter: begin staged is_blocked recompute: %w", err)
+	}
+	if _, err := issueops.RecomputeAllIsBlockedInTx(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("federation filter: recompute staged is_blocked: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("federation filter: commit staged is_blocked recompute: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?)",
+		"federation: exclude private issue types"); err != nil {
+		return fmt.Errorf("federation filter: commit filtered state: %w", err)
+	}
+	return nil
 }
 
 // prepareCLIRouteForPeerGitProtocol reports whether the SQL-visible peer

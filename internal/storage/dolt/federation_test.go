@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/schema"
+	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -659,6 +661,107 @@ func TestFilteredPushExcludesCustomType(t *testing.T) {
 	}
 	if msgCount != 1 {
 		t.Errorf("message should survive on original branch (filter is non-destructive)")
+	}
+}
+
+// TestFilteredStagingPublishesRetainedWaiterUnblocked proves the staging HEAD
+// derives blocked state from its filtered graph: removing X and W->X must
+// publish retained waiter W with is_blocked=false.
+func TestFilteredStagingPublishesRetainedWaiterUnblocked(t *testing.T) {
+	if os.Getenv("BEADS_TEST_ENV_RUN_DOLT") == "1" && testServerPort == 0 {
+		t.Fatal("BEADS_TEST_ENV_RUN_DOLT=1 but real-Dolt test infrastructure is unavailable")
+	}
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	waiter := &types.Issue{ID: "fed-filter-w", Title: "retained waiter", IssueType: types.TypeBug, Status: types.StatusOpen, Priority: 1}
+	blocker := &types.Issue{ID: "fed-filter-x", Title: "excluded blocker", IssueType: types.TypeTask, Status: types.StatusOpen, Priority: 1, Labels: []string{"private"}}
+	if err := store.CreateIssue(ctx, waiter, "test"); err != nil {
+		t.Fatalf("create waiter: %v", err)
+	}
+	if err := store.CreateIssue(ctx, blocker, "test"); err != nil {
+		t.Fatalf("create blocker: %v", err)
+	}
+	if err := store.AddDependency(ctx, &types.Dependency{IssueID: waiter.ID, DependsOnID: blocker.ID, Type: types.DepBlocks}, "test"); err != nil {
+		t.Fatalf("add blocking dependency: %v", err)
+	}
+	if !isBlocked(ctx, t, store.db, waiter.ID) {
+		t.Fatal("precondition: waiter must be blocked by X")
+	}
+
+	conn, err := store.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire staging connection: %v", err)
+	}
+	defer conn.Close()
+	var sourceBranch string
+	if err := conn.QueryRowContext(ctx, "SELECT active_branch()").Scan(&sourceBranch); err != nil {
+		t.Fatalf("read source branch: %v", err)
+	}
+	for _, table := range []string{"issues", "dependencies", "labels"} {
+		if err := schema.DrainCall(ctx, conn, "CALL DOLT_ADD(?)", table); err != nil {
+			t.Fatalf("stage seed %s: %v", table, err)
+		}
+	}
+	if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('--allow-empty', '-m', 'test: filtered staging seed')"); err != nil {
+		t.Fatalf("commit staging seed: %v", err)
+	}
+	var seedBlockerCount int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues AS OF 'HEAD' WHERE id = ?", blocker.ID).Scan(&seedBlockerCount); err != nil {
+		t.Fatalf("count source blocker at HEAD: %v", err)
+	}
+	if seedBlockerCount != 1 {
+		t.Fatalf("source blocker count at HEAD = %d, want 1", seedBlockerCount)
+	}
+	var seedLabelCount int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM labels AS OF 'HEAD' WHERE issue_id = ?", blocker.ID).Scan(&seedLabelCount); err != nil {
+		t.Fatalf("count source blocker labels at HEAD: %v", err)
+	}
+	if seedLabelCount != 1 {
+		t.Fatalf("source blocker label count at HEAD = %d, want 1", seedLabelCount)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?, ?)", federationStagingBranch, sourceBranch); err != nil {
+		t.Fatalf("create staging branch: %v", err)
+	}
+	defer func() {
+		_ = schema.DrainCall(ctx, conn, "CALL DOLT_CHECKOUT(?)", sourceBranch)
+		_ = schema.DrainCall(ctx, conn, "CALL DOLT_BRANCH('-Df', ?)", federationStagingBranch)
+	}()
+	if err := versioncontrolops.CheckoutBranch(ctx, conn, federationStagingBranch); err != nil {
+		t.Fatalf("checkout staging branch: %v", err)
+	}
+	result, err := conn.ExecContext(ctx, "DELETE FROM issues WHERE issue_type = ?", types.TypeTask)
+	if err != nil {
+		t.Fatalf("delete excluded blocker: %v", err)
+	}
+	if deleted, err := result.RowsAffected(); err != nil || deleted != 1 {
+		t.Fatalf("deleted blockers = %d, err = %v, want 1, nil", deleted, err)
+	}
+	if err := store.commitFilteredStaging(ctx, conn); err != nil {
+		t.Fatalf("commit filtered staging: %v", err)
+	}
+
+	var blocked bool
+	if err := conn.QueryRowContext(ctx, "SELECT is_blocked FROM issues AS OF 'HEAD' WHERE id = ?", waiter.ID).Scan(&blocked); err != nil {
+		t.Fatalf("read retained waiter at staging HEAD: %v", err)
+	}
+	if blocked {
+		t.Fatal("staging HEAD published retained waiter as blocked after excluding its only blocker")
+	}
+	var blockerCount, edgeCount, labelCount int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues AS OF 'HEAD' WHERE id = ?", blocker.ID).Scan(&blockerCount); err != nil {
+		t.Fatalf("count blocker at staging HEAD: %v", err)
+	}
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM dependencies AS OF 'HEAD' WHERE issue_id = ? AND depends_on_issue_id = ?", waiter.ID, blocker.ID).Scan(&edgeCount); err != nil {
+		t.Fatalf("count edge at staging HEAD: %v", err)
+	}
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM labels AS OF 'HEAD' WHERE issue_id = ?", blocker.ID).Scan(&labelCount); err != nil {
+		t.Fatalf("count blocker labels at staging HEAD: %v", err)
+	}
+	if blockerCount != 0 || edgeCount != 0 || labelCount != 0 {
+		t.Fatalf("staging HEAD blocker count = %d, edge count = %d, label count = %d, want 0, 0, 0", blockerCount, edgeCount, labelCount)
 	}
 }
 
