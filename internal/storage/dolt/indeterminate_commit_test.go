@@ -104,6 +104,45 @@ func TestIndeterminateCommitIsSurfacedNotRetried(t *testing.T) {
 	}
 }
 
+func TestWithRetryTxIndeterminateCommitFailuresTripCircuitWithoutReplay(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	breaker := newTestCircuitBreaker(t)
+	driver := &failureDriver{commitErr: testConnectionLoss}
+	store := newFailureStore(driver)
+	store.breaker = breaker
+	defer func() { _ = store.db.Close() }()
+
+	ctx := t.Context()
+	var callbacks atomic.Int32
+	for attempt := 1; attempt <= circuitFailureThreshold; attempt++ {
+		err := store.withRetryTx(ctx, func(tx *sql.Tx) error {
+			callbacks.Add(1)
+			_, err := tx.ExecContext(ctx, "UPDATE issues SET title = ?", "changed")
+			return err
+		})
+		if !errors.Is(err, ErrCommitIndeterminate) {
+			t.Fatalf("withRetryTx() attempt %d error = %v, want ErrCommitIndeterminate", attempt, err)
+		}
+		if got := driver.begins.Load(); got != int32(attempt) {
+			t.Fatalf("transaction begins after attempt %d = %d, want %d", attempt, got, attempt)
+		}
+		if got := callbacks.Load(); got != int32(attempt) {
+			t.Fatalf("callback calls after attempt %d = %d, want %d", attempt, got, attempt)
+		}
+		if got := driver.execs.Load(); got != int32(attempt) {
+			t.Fatalf("SQL mutations after attempt %d = %d, want %d", attempt, got, attempt)
+		}
+
+		wantState := circuitClosed
+		if attempt == circuitFailureThreshold {
+			wantState = circuitOpen
+		}
+		if got := breaker.State(); got != wantState {
+			t.Fatalf("circuit state after attempt %d = %q, want %q", attempt, got, wantState)
+		}
+	}
+}
+
 func TestDoltAutocommitRollbackCommitIsRetried(t *testing.T) {
 	rollback := &mysql.MySQLError{
 		Number:  1105,

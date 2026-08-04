@@ -1054,6 +1054,7 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 		// A commit result marked indeterminate may have landed before its
 		// response was lost. Never replay the callback in that case.
 		if errors.Is(err, ErrCommitIndeterminate) {
+			err = s.recordDoltPublicationFailure(ctx, err)
 			return backoff.Permanent(fmt.Errorf("write commit result indeterminate after connection loss (not retried to avoid double-apply): %w", err))
 		}
 		// Serialization failures (1213/1205) guarantee a server-side rollback,
@@ -3029,8 +3030,8 @@ func (s *DoltStore) wrapDoltPublicationFailure(ctx context.Context, op string, e
 }
 
 // recordDoltPublicationFailure accounts once for an ambiguous connection loss
-// at a direct Dolt publication boundary. These paths deliberately stay outside
-// withRetry because replay could report an already-applied commit as a new one.
+// at a Dolt publication boundary. Direct publication helpers stay outside
+// withRetryTx; transaction-backed writes call this from withRetryTx itself.
 func (s *DoltStore) recordDoltPublicationFailure(ctx context.Context, err error) error {
 	if s.breaker == nil || !errors.Is(err, ErrCommitIndeterminate) || !isConnectionError(err) {
 		return err
